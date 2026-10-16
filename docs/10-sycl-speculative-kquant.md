@@ -28,7 +28,7 @@ drafter (patch 0009, `SPEC_TIMING=1`) gives, per step at draft length 3:
 | draft sampling (backend) | ~0 |
 | **verify 4 tokens through the target** | **~60 ms** (a single token is 34 ms) |
 
-So the 4-token verify costs 1.77x a 1-token step, and `llama-batched-bench` says the same about any 4-column batch
+(Measured on the unpatched kernels; the split has not been re-recorded on the deployed build.) So the 4-token verify costs 1.77x a 1-token step, and `llama-batched-bench` says the same about any 4-column batch
 (B=1: 25.1 t/s, B=4: 62.7 t/s aggregate = 1.6x the step time). Per kernel, the multi-column reorder mat-vecs were
 far from "weights read once": Q4_K 17408x5120 at n=4 took 1.79x the n=1 time, Q5_K 5120x17408 2.2x, Q6_K lm head
 1.54x. Beyond 8 columns the backend leaves MMVQ for the dequant + XMX GEMM path and collapses (B=12: 33 t/s).
@@ -81,14 +81,21 @@ Per kernel (us/run, `test-backend-ops perf`, same card):
 | Q5_K 10240x5120 (attn qkv) | 4 | 103.5 | 92.8 |
 | Q6_K 248320x5120 (lm head) | 4 | 2682 | 2053 |
 
-End to end (`llama-batched-bench`, aggregate t/s): B=4 62.7 -> 70.0, B=6 65.6 -> 75.8, B=8 66.8 -> 74.8; B=1
-unchanged (25.1). Served configuration (probabilistic MTP, n-max 3), speed subset median: **41.9 -> 47.7 tok/s**
-in back-to-back runs, i.e. 36.0 -> 47.7 (+32 %) over the day's starting point. Draft length 4 re-tested on the new
-kernels: 42.0, so n-max 3 stays.
+End to end, deterministic (`llama-batched-bench`, aggregate t/s): B=4 62.7 -> 70.0, B=6 65.6 -> 75.8, B=8
+66.8 -> 74.8; B=1 unchanged (25.1).
 
-Correctness: `test-backend-ops test -o MUL_MAT` 2273/2273 against the CPU backend; perplexity over the same 8x512
-tokens, official vs patched: 6.6087 vs 6.6117 at ubatch 1, 6.6217 vs 6.6241 at ubatch 4 (+-0.35), i.e. float
-reordering only.
+Served configuration (probabilistic MTP, n-max 3), **4-task speed subset, temperature 1.0, 2048-token budget, one
+run per runtime, back to back**: median 41.9 -> 47.7 tok/s, total wall 160 -> 135 s, 4/4 passed on both. Against
+the day's starting configuration (greedy drafts, official kernels: 36.0) that is +32 % on this subset. Caveats that
+the number does not cover: the subset's run-to-run noise at temperature 1.0 is a few tok/s (repeat runs of the same
+configuration: 41.9 / 42.0 / 42.1 / 42.8 / 43.5 for the probabilistic baseline); the full 39-task suite, deep
+contexts (where the 16 attention layers add verify cost) and the agent configuration (768 budget, tool output in the
+prompt) have not been measured yet. Draft length 4 re-tested on the new kernels: 42.0, so n-max 3 stays.
+
+No regression detected: `test-backend-ops test -o MUL_MAT` 2273/2273 against the CPU backend; perplexity over the
+same 8x512 tokens, official vs patched: 6.6087 vs 6.6117 at ubatch 1, 6.6217 vs 6.6241 at ubatch 4. The kernels
+reorder float accumulation by construction, so results are close, not bit-identical; eight chunks bound gross errors
+only.
 
 ## 5. Things that did not work (details in 08)
 Four rows per sub-group everywhere (Q6_K and small matrices got slower; the fused GLU kernel spilled), the large

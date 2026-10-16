@@ -20,8 +20,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    MTP drafter was accepting 41-50 % of its greedy drafts at temperature 1.0; `--spec-draft-sampling probabilistic`
    (exact target distribution) takes it to 51-69 % and 36 -> 42 tok/s. The 4-token verify then cost 1.8x a single
    token because the K-quant multi-column kernels were issue-bound; four rows per sub-group, uniform scale loads and
-   an un-fused gate/up at n >= 3 make 4-column mat-vecs 20-40 % faster: 42 -> 48 tok/s served, plain decode and
-   perplexity unchanged. [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
+   an un-fused gate/up at n >= 3 make 4-column mat-vecs 20-40 % faster (deterministic: batched-bench B=4 +12 %).
+   Served, on a 4-task subset at a 2048 budget, one run each: 41.9 -> 47.7 tok/s median and 160 -> 135 s total wall;
+   plain decode unchanged; no regression detected in 2273 op tests and an 8-chunk perplexity A/B. Not yet measured on
+   the full suite, at depth, or in the agent configuration. [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
