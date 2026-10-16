@@ -9,7 +9,7 @@ All at the 39-task single-turn suite unless noted. Full per-task grids, conversa
 |---|---|---|---|---|
 | Flash-Next | Qwen3.8-Flash-Next (MoE) | IQ3_S | Strata 0.1.44, SYCL engine, 262k ctx | 44-47 |
 | Swift 1.5 | Swift 1.5 (MoE) | IQ3_S | Strata 0.1.44, SYCL engine | 45-47 |
-| Orca 27B | a dense Qwen3-based 27B cyber fine-tune | Q4_K_S (imatrix requant) | llama.cpp b11541 SYCL, MTP + n-gram drafting | 37 |
+| Orca 27B | OrcaSAQ-2-Cyber-27B (orcarouter), dense Qwen3-based | Q4_K_S (imatrix requant) | llama.cpp b11541 SYCL, MTP + n-gram drafting | 37 |
 | LFM2.5 | LiquidAI LFM2.5-24B-A2B | Q6_K | llama.cpp b11541 SYCL, n-gram drafting | 128 |
 | Bolt | NVIDIA Nemotron 3.5 Bolt 74B-A9B (hybrid Mamba-2 + MoE) | IQ2_XXS (unsloth) | llama.cpp b11669, SYCL then Vulkan + DFlash | 29 -> 50 |
 

@@ -3,7 +3,7 @@
 This was the single most useful result of the whole exercise, and it held for every reasoning model tried.
 
 ## What happened with unlimited thinking
-With a 16k output limit and no budget, the Strata models and the 27B dense model regularly *thought until the
+With a 16k output limit and no budget, the Strata models and Orca 27B regularly *thought until the
 limit and never answered*. Flash-Next lost 9 of 39 answers that way, Swift 6, Orca 12. Those runs took 69-120
 minutes against 15-35 minutes with a budget. Nearly every miss in the first 24-task run was this failure, not a
 wrong answer.
