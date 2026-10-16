@@ -29,6 +29,12 @@ Mamba-2 / MoE model whose tensors are IQ2_XXS and NVFP4.
 without touching the host. A llama.cpp built inside it links a newer glibc than trixie has, so the binary only runs in
 the sid runtime container; the official release archive runs in both.
 
+## Versions used
+llama.cpp releases b11541 (first SYCL runs), b11669 (first Nemotron 3.5 Bolt support; the Vulkan patches in `patches/`
+are against it) and b11696 (the current SYCL default; +24 % Orca prefill over b11541 from the upstream q4_K/q5_K
+dequant stores, decode unchanged). Strata v0.1.44 -> v0.1.44.1. Releases are checked against the digest the GitHub
+release API reports before use.
+
 ## Verified before use
 Release archives were checked against the SHA-256 reported by the GitHub release API. Model files were checked
 against the Hugging Face file digests. When a repo was re-uploaded (the Bolt GGUF repo was rewritten by its uploader

@@ -10,7 +10,12 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   2048` and `--prefill 4096`. Measured 859 tok/s prompt reading at 25k and 848 at 74k, decode 52 short / 47 after a
   74k prompt, 2.2 GB VRAM spare. The project's docs warn that 262k *without* kv-resident livelocked a B70; keep it.
 - **Thinking budget** is per request (`reasoning_budget_tokens`), which is what made the budget matrix cheap to run
-  on these two models (no server restart). Both configs should carry 2048 as default, see `04-thinking-budget.md`.
+  on these two models (no server restart). The same key at the top level of `strata-<model>.json` makes it the server
+  default (a request's own value wins, 0 = none); both configs now carry 2048, see `04-thinking-budget.md`.
+- **0.1.44.1** (2026-10-16) is a hotfix release (Metal launch sizes, CPU NVFP4 ISA guards, Responses API honours
+  `reasoning_effort`, setup re-run keeps the model size); nothing in the SYCL engine changed, so no speed change on the
+  B70. Updating is: `git fetch --tags && git checkout <tag>`, rebuild the engine with the documented container command
+  (about 7 minutes, AOT for `bmg-g31`), `./setup.sh --backend sycl --update`.
 - **Sampling**: Strata decodes greedily when the request has no sampling block, which loops. Put the Qwen
   recommendation (temp 1.0, top_p 0.95, top_k 20, presence 1.5) in the config and send it from the client.
 - **Control vector**: Strata ships a per-layer control vector (`--cvec-mode project`, layers 4-44) that removes one
