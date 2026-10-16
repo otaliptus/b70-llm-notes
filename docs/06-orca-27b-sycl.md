@@ -21,8 +21,12 @@ flips, so measure both backends per model.
 
 ## Drafting
 `--spec-type draft-mtp,ngram-mod --spec-draft-n-max 3`: MTP (the model's own multi-token-prediction head) gives
-+30 % decode, adding the n-gram drafter another +7 %. Prompt-cache reuse (`--cache-reuse`) is unsupported for this
-hybrid-attention model and was dropped.
++30 % decode, adding the n-gram drafter another +7 % (on b11696 the n-gram part measured as noise). Prompt-cache
+reuse (`--cache-reuse`) is unsupported for this hybrid-attention model and was dropped.
+
+Update 2026-10-16: add `--spec-draft-sampling probabilistic` (36 -> 42 tok/s, exact target distribution) and see
+`10-sycl-speculative-kquant.md` for the per-step time split and the multi-column kernel work that takes the served
+configuration to 48 tok/s. Draft lengths 4 and 5 are slower in every mode.
 
 ## Quantization study (imatrix requant from IQ4_XS)
 IQ4_XS decodes at 13 tok/s on Vulkan/BMG and IQ3_M at 11 on SYCL: the IQ dequant paths are slow on Intel. A
