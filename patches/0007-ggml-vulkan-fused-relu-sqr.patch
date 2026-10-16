@@ -1,0 +1,28 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index a41ce59..67746ba 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -870,6 +870,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_gelu_quick[2];
+     vk_pipeline pipeline_silu[2];
+     vk_pipeline pipeline_relu[2];
++    vk_pipeline pipeline_relu_sqr[2];   // fused relu -> sqr (relu^2 activations)
+     vk_pipeline pipeline_sqr[2];
+     vk_pipeline pipeline_sqrt[2];
+     vk_pipeline pipeline_sin[2];
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp b/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
+index 9ee7769..892527f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/unary.comp
+@@ -71,6 +71,11 @@ float op_relu(float x) {
+     return max(x, 0.0f);
+ }
+ 
++float op_relu_sqr(float x) {
++    const float r = max(x, 0.0f);
++    return r * r;
++}
++
+ float op_sigmoid(float x) {
+     return 1.0f / (1.0f + exp(-x));
+ }

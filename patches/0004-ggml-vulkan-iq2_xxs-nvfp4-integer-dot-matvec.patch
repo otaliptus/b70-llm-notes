@@ -1,0 +1,101 @@
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 3383aa8..aa7b96b 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -12,11 +12,11 @@
+ 
+ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+ 
+-#if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K)
++#if defined(DATA_A_Q2_0) || defined(DATA_A_QUANT_K) || defined(DATA_A_NVFP4)
+ #define K_PER_ITER 16
+ #elif defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4)
+ #define K_PER_ITER 8
+-#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS)
++#elif defined(DATA_A_IQ1_S) || defined(DATA_A_IQ1_M) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ2_XXS)
+ #define K_PER_ITER 32
+ #else
+ #error unimplemented
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+index 03c348b..fc2c549 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq_funcs.glsl
+@@ -470,6 +470,78 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+ }
+ #endif
+ 
++#if defined(DATA_A_NVFP4)
++// One 16-element sub-block per call (K_PER_ITER 16): 2 x uint32 of e2m1 nibbles + a UE4M3 scale byte. Byte j of
++// the sub-block holds elements j (low nibble) and j+8 (high nibble). Integer dot against the q8_1 activations.
++// 4 e2m1 codes (low nibbles of the 4 bytes of x) -> 4 signed int8 (2*e2m1), SIMD-within-a-register, no table loads
++// (shared-memory lookups compile to slow "send" messages on Intel).
++int32_t nvfp4_swar_i8x4(uint x) {
++    const uint k  = x & 0x07070707u;                       // magnitude code 0..7
++    const uint hi = (x >> 2) & 0x01010101u;                // k >= 4
++    const uint b1 = (x >> 1) & 0x01010101u;                // bit 1 of k
++    const uint m  = x & 0x01010101u;                       // mantissa bit
++    uint t = 0x04040404u + (m << 1);                       // k >= 4: (4 + 2m) << b1 = 4, 6, 8, 12
++    t += t & (b1 * 0xFFu);
++    uint v = k ^ ((k ^ t) & (hi * 0xFFu));                 // k < 4: value = k
++    const uint s  = (x >> 3) & 0x01010101u;                // sign, but never negate a zero
++    const uint nz = ((k + 0x7F7F7F7Fu) >> 7) & 0x01010101u;
++    const uint sm = s & nz;
++    return int32_t((v ^ (sm * 0xFFu)) + sm);
++}
++i32vec2 nvfp4_repack(uint w) {
++    return i32vec2(nvfp4_swar_i8x4(w & 0x0F0F0F0Fu), nvfp4_swar_i8x4((w >> 4) & 0x0F0F0F0Fu));
++}
++float nvfp4_scale_q(uint ib, uint sub) {
++    const uint u = (data_a_packed32[ib].d[0] >> (8u * sub)) & 0x7Fu;
++    const uint e = u >> 3;
++    const uint m = u & 7u;
++    const float r = (e == 0u) ? float(m) * (1.0 / 512.0) : uintBitsToFloat(((e + 120u) << 23) | (m << 20));
++    return (u == 0x7Fu) ? 0.0 : r;
++}
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    const uint ib  = ib_a / 2;                 // 64-element block
++    const uint sub = (ib_a % 2) * 2 + iqs;     // 16-element sub-block 0..3
++    const i32vec2 q0 = nvfp4_repack(data_a_packed32[ib].qs[2 * sub    ]);   // elements 0..3 (lo), 8..11 (hi)
++    const i32vec2 q1 = nvfp4_repack(data_a_packed32[ib].qs[2 * sub + 1]);   // elements 4..7 (lo), 12..15 (hi)
++    int32_t q_sum = dotPacked4x8EXT(q0.x, cache_b_qs[0]);
++    q_sum += dotPacked4x8EXT(q1.x, cache_b_qs[1]);
++    q_sum += dotPacked4x8EXT(q0.y, cache_b_qs[2]);
++    q_sum += dotPacked4x8EXT(q1.y, cache_b_qs[3]);
++    // kvalues are 2*e2m1, hence the 0.5
++    return FLOAT_TYPE(float(cache_b_ds.x) * nvfp4_scale_q(ib, sub) * float(q_sum) * 0.5);
++}
++#endif
++
++#if defined(DATA_A_IQ2_XXS)
++// One 32-element sub-block (ib32) per call: 4 groups of 8 values from the E8 lattice codebook, 7+1 sign bits per
++// group and a 4-bit scale. Integer dot product against the q8_1 activations (CUDA's vec_dot_iq2_xxs_q8_1 layout).
++FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
++    const uint ib   = ib_a / 8;
++    const uint ib32 = ib_a % 8;
++    // qs bytes [8*ib32 .. +3] = 4 grid indices, [8*ib32+4 .. +7] = 4 x 7 sign bits + 4-bit scale
++    const uint grid_idx  = pack32(u16vec2(data_a_packed16[ib].qs[4 * ib32 + 0], data_a_packed16[ib].qs[4 * ib32 + 1]));
++    const uint signscale = pack32(u16vec2(data_a_packed16[ib].qs[4 * ib32 + 2], data_a_packed16[ib].qs[4 * ib32 + 3]));
++
++    int32_t q_sum = 0;
++    [[unroll]] for (uint l = 0; l < 4; ++l) {
++        const uvec2 grid = iq2xxs_grid[(grid_idx >> (8 * l)) & 0xFFu];
++        uint s = bitfieldExtract(signscale, int(7 * l), 7);
++        s |= (bitCount(s) & 1u) << 7;                         // the 8th sign is the parity of the other 7
++        // spread 4 sign bits each into byte masks (0xFF where negative)
++        const uint m0 = ((( s       & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu;
++        const uint m1 = ((((s >> 4) & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu;
++        // per-byte negate: (x ^ 0xFF) + 1; grid magnitudes are never 0 so no carry crosses a byte
++        const int32_t g0 = int32_t((grid.x ^ m0) + (m0 & 0x01010101u));
++        const int32_t g1 = int32_t((grid.y ^ m1) + (m1 & 0x01010101u));
++        q_sum += dotPacked4x8EXT(g0, cache_b_qs[2 * l]);
++        q_sum += dotPacked4x8EXT(g1, cache_b_qs[2 * l + 1]);
++    }
++
++    const float ls = float(((signscale >> 28) << 1) | 1u);   // 2*scale + 1
++    return FLOAT_TYPE(float(cache_b_ds.x) * float(data_a[ib].d) * float(q_sum) * ls * 0.125);
++}
++#endif
++
+ #if defined(DATA_A_IQ1_S)
+ void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
+     const uint ib32 = iqs / 32;

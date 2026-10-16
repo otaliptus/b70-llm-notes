@@ -61,3 +61,4 @@ an `undo`.
 | Bolt, Vulkan b11669 host | 777 | 41.9 | |
 | Bolt, Vulkan + DFlash n=3 | 777 | 50 median over 39 tasks | see 05 |
 | Bolt, Vulkan + DFlash, ssm tensors Q4_0 | 966 | 56 | +13 % perplexity, opt-in |
+| Bolt, patched Vulkan kernels (09) | 789 | 51.0 plain, **64.2 median with DFlash n=3** | 34/39, perplexity unchanged |

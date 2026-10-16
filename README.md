@@ -12,6 +12,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    decode over Vulkan. For Nemotron 3.5 Bolt (hybrid Mamba-2 + MoE, IQ2_XXS + NVFP4) Vulkan gives +45 % decode and
    the DFlash drafter at draft length 3 another +20 %: 29 -> 50 tok/s, same score, 1.7x less wall time.
    [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md), [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md)
+4. **The Vulkan kernels had another +21 % in them.** An integer-dot path for IQ2_XXS, a dedicated NVFP4 shader and a
+   one-line class of bug in the fused router (runtime loop bounds pushing register arrays to scratch) take plain decode
+   from 42 to 51 tok/s, and the served configuration (DFlash drafter) from a 50 to a 64 tok/s median, with unchanged
+   perplexity. [`docs/09-vulkan-kernels.md`](docs/09-vulkan-kernels.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
@@ -26,9 +30,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md) | Orca 27B (OrcaSAQ-2-Cyber-27B, dense): backend, MTP drafting, imatrix quant study, 262k KV, power cap |
 | [`docs/07-strata-notes.md`](docs/07-strata-notes.md) | Strata engine on Battlemage: AOT build, kv-resident 262k, sampling, control vector |
 | [`docs/08-dead-ends.md`](docs/08-dead-ends.md) | everything measured and rejected, with numbers |
+| [`docs/09-vulkan-kernels.md`](docs/09-vulkan-kernels.md) | llama.cpp Vulkan kernel work: IQ2_XXS int8 dot, dedicated NVFP4 shader, router fix; 42 -> 51 tok/s plain decode |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
 | [`scripts/`](scripts/) | serve / build / sweep / profile / requant / perplexity scripts |
-| [`patches/`](patches/) | two llama.cpp (b11669) patches: SYCL `out_prod` strided f32 fix (makes DFlash run on SYCL), Vulkan Intel rows-per-workgroup env knobs (for experiments) |
+| [`patches/`](patches/) | llama.cpp (b11669) patches: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes |
 
 ## Quick start
 ```sh
