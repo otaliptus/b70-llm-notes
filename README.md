@@ -8,7 +8,7 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 1. **A hard thinking budget (~2048 tokens) beats unlimited thinking** for every Qwen-family reasoning model tried:
    higher score *and* 2-4x less wall time, because unlimited runs regularly think to the output limit and never
    answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md)
-2. **The faster backend depends on the model.** For a dense 27B Q4_K_S, SYCL gives 2.4x the prefill and +10-30 %
+2. **The faster backend depends on the model.** For Orca 27B (dense) Q4_K_S, SYCL gives 2.4x the prefill and +10-30 %
    decode over Vulkan. For Nemotron 3.5 Bolt (hybrid Mamba-2 + MoE, IQ2_XXS + NVFP4) Vulkan gives +45 % decode and
    the DFlash drafter at draft length 3 another +20 %: 29 -> 50 tok/s, same score, 1.7x less wall time.
    [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md), [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md)
@@ -23,7 +23,7 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/03-results.md`](docs/03-results.md) | all models, all scenarios, speeds |
 | [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md) | the budget finding |
 | [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md) | SYCL -> Vulkan -> DFlash -> requant on Nemotron 3.5 Bolt, with the per-op profile |
-| [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md) | dense 27B: backend, MTP drafting, imatrix quant study, 262k KV, power cap |
+| [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md) | Orca 27B (OrcaSAQ-2-Cyber-27B, dense): backend, MTP drafting, imatrix quant study, 262k KV, power cap |
 | [`docs/07-strata-notes.md`](docs/07-strata-notes.md) | Strata engine on Battlemage: AOT build, kv-resident 262k, sampling, control vector |
 | [`docs/08-dead-ends.md`](docs/08-dead-ends.md) | everything measured and rejected, with numbers |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
@@ -40,7 +40,7 @@ python3 bench/run_bench.py --name bolt-b2048 --url http://127.0.0.1:18081/v1 --k
         --model nemotron-3.5-bolt-74b-a9b --temperature 1.0 --top-p 0.95 --top-k 0
 python3 bench/report.py                               # bench/results/report.md
 ```
-Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), a dense Qwen3-based 27B (Q4_K_S), LiquidAI
+Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), OrcaSAQ-2-Cyber-27B (Q4_K_S), LiquidAI
 LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541 and
 b11669. Dates 2026-10-10 to 2026-10-16.
 
