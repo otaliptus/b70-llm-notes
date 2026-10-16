@@ -1,0 +1,289 @@
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+index 911ceac..5dcb0bf 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dequant_funcs.glsl
+@@ -512,34 +512,50 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+ #endif
+ 
+ #if defined(DATA_A_NVFP4)
++#ifndef USE_OCP_FP4
++// Arithmetic UE4M3 decode of the per-16 scale (7 bits used; 0x7F is the NaN pattern and decodes to 0 like the LUT).
++float nvfp4_scale(uint ib, uint sub, uint a_offset) {
++    const uint u = (data_a_packed32[a_offset + ib].d[0] >> (8u * sub)) & 0x7Fu;
++    const uint e = u >> 3;
++    const uint m = u & 7u;
++    const float r = (e == 0u) ? float(m) * (1.0 / 512.0) : uintBitsToFloat(((e + 120u) << 23) | (m << 20));
++    return (u == 0x7Fu) ? 0.0 : r;
++}
++// The 4 e2m1 codes in the low nibbles of the 4 bytes of w, as floats scaled by 2 (0,1,2,3,4,6,8,12 with sign).
++vec4 nvfp4_vals(uint w) {
++    const uint n0 = w & 0xFu, n1 = (w >> 8) & 0xFu, n2 = (w >> 16) & 0xFu, n3 = (w >> 24) & 0xFu;
++    const vec4 v = vec4(float((0xC8643210u >> (4u * (n0 & 7u))) & 0xFu),
++                        float((0xC8643210u >> (4u * (n1 & 7u))) & 0xFu),
++                        float((0xC8643210u >> (4u * (n2 & 7u))) & 0xFu),
++                        float((0xC8643210u >> (4u * (n3 & 7u))) & 0xFu));
++    return uintBitsToFloat(floatBitsToUint(v) | (uvec4(n0, n1, n2, n3) & 8u) << 28);
++}
++#endif
+ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+     const uint sub = iqs >> 4;
+-    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
+     const uint j = iqs & 7;
+     const uint shift = (iqs & 8) >> 1; // 0 or 4
+ #ifdef USE_OCP_FP4
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
+     const uint vui = uint(data_a_packed16[a_offset + ib].qs[(sub * 8u + j) / 2u]);
+     return vec2(bitcastExtractfe2m1EXT(unpack8(vui).xy, shift)) * d;
+ #else
+-    const uint vui0 = uint(data_a[a_offset + ib].qs[sub * 8u + j]);
+-    const uint vui1 = uint(data_a[a_offset + ib].qs[sub * 8u + j + 1]);
+-    const uint qs0 = (vui0 >> shift) & 0xF;
+-    const uint qs1 = (vui1 >> shift) & 0xF;
+-    return vec2(float(kvalues_mxfp4[qs0]), float(kvalues_mxfp4[qs1])) * d * 0.5;
++    // byte j of sub-block `sub` holds elements j (low nibble) and j+8 (high nibble)
++    const uint w = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) >> 2] >> (shift + 8u * (j & 3u));
++    return nvfp4_vals(w).xy * (0.5 * nvfp4_scale(ib, sub, a_offset));
+ #endif
+ }
+ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+-#ifdef USE_OCP_FP4
+     const uint sub = iqs >> 4;
+-    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
+     const uint j = iqs & 7;
+     const uint shift = (iqs & 8) >> 1; // 0 or 4
++#ifdef USE_OCP_FP4
++    const float d = ue4m3_to_fp32(data_a[a_offset + ib].d[sub]);
+     const uint vui = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) / 4u];
+     return vec4(bitcastExtractfe2m1EXT(unpack8(vui), shift)) * d;
+ #else
+-    const vec2 v0 = dequantize(ib, iqs, a_offset);
+-    const vec2 v1 = dequantize(ib, iqs + 2u, a_offset);
+-    return vec4(v0.x, v0.y, v1.x, v1.y);
++    const uint w = data_a_packed32[a_offset + ib].qs[(sub * 8u + j) >> 2] >> shift;
++    return nvfp4_vals(w) * (0.5 * nvfp4_scale(ib, sub, a_offset));
+ #endif
+ }
+ #endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+index 34be1f7..5a38db7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec.comp
+@@ -2,6 +2,11 @@
+ 
+ #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+ 
++// The mat-vec NVFP4 path decodes scales and values arithmetically (dequant_funcs.glsl); skip the shared tables + barrier.
++#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
++#define NVFP4_NO_LUT
++#endif
++
+ #include "mul_mat_vec_base.glsl"
+ #include "dequant_funcs.glsl"
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+index ec0a80c..2ff78f1 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/types.glsl
+@@ -1911,7 +1911,7 @@ i32vec2 iq4nl_to_i8x8(uint32_t vui) {
+ #endif
+ 
+ #if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)
+-#if !defined(USE_OCP_FP4)
++#if !defined(USE_OCP_FP4) && !defined(NVFP4_NO_LUT)
+ const int8_t kvalues_mxfp4_const[16] = {
+     int8_t(0), int8_t(1), int8_t(2), int8_t(3), int8_t(4), int8_t(6), int8_t(8), int8_t(12),
+     int8_t(0), int8_t(-1), int8_t(-2), int8_t(-3), int8_t(-4), int8_t(-6), int8_t(-8), int8_t(-12),
+@@ -1920,7 +1920,7 @@ const int8_t kvalues_mxfp4_const[16] = {
+ shared int8_t kvalues_mxfp4[16];
+ #endif
+ 
+-#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4)
++#if defined(DATA_A_NVFP4) && !defined(USE_OCP_FP4) && !defined(NVFP4_NO_LUT)
+ // UE4M3 scale in NVFP4 blocks use only 7 bits; sign (bit 7) is always zero.
+ shared float ue4m3_fp32_lut[128];
+ 
+@@ -1938,7 +1938,7 @@ float ue4m3_to_fp32_build(uint u) {
+ }
+ #endif
+ 
+-#if (defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)) && !defined(USE_OCP_FP4)
++#if (defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)) && !defined(USE_OCP_FP4) && !defined(NVFP4_NO_LUT)
+ #define NEEDS_INIT_IQ_SHMEM
+ void init_iq_shmem(uvec3 wgsize)
+ {
+@@ -1998,6 +1998,7 @@ floate4m3_t ue4m3_from_bits(uint8_t x) {
+ }
+ #endif
+ 
++#if !defined(NVFP4_NO_LUT)
+ float ue4m3_to_fp32(uint8_t x) {
+ #if defined(USE_OCP_FP4)
+     return float(ue4m3_from_bits(x));
+@@ -2006,6 +2007,7 @@ float ue4m3_to_fp32(uint8_t x) {
+ #endif
+ }
+ #endif
++#endif
+ 
+ #if BDA
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nvfp4.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nvfp4.comp
+new file mode 100644
+index 0000000..9efe83c
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nvfp4.comp
+@@ -0,0 +1,154 @@
++#version 450
++#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++
++// Dedicated NVFP4 mat-vec (no FP4 hardware path): each thread handles one 16-element sub-block of a 64-element
++// block per step: 2 x uint32 of e2m1 nibbles + the UE4M3 scale byte, decoded arithmetically (no shared-memory
++// tables, no per-element address math). Byte j of a sub-block holds elements j (low nibble) and j+8 (high nibble).
++#define NVFP4_NO_LUT
++#include "mul_mat_vec_base.glsl"
++
++
++layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
++
++FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
++
++// UE4M3 (7 bits used) -> float; 0x7F is the NaN pattern and decodes to 0.
++float nvfp4_scale(uint u) {
++    const uint e = u >> 3;
++    const uint m = u & 7u;
++    const float r = (e == 0u) ? float(m) * (1.0 / 512.0) : uintBitsToFloat(((e + 120u) << 23) | (m << 20));
++    return (u == 0x7Fu) ? 0.0 : r;
++}
++
++// 4 e2m1 codes in the low nibbles of the 4 bytes of w -> floats scaled by 2 (0,1,2,3,4,6,8,12 with sign).
++// SIMD-within-a-register: every step below handles all 4 codes in one 32-bit operation (the kernel is
++// instruction-issue bound on Xe2, so ops per element is what matters).
++vec4 nvfp4_vals(uint w) {
++    const uint x  = w & 0x0F0F0F0Fu;
++    const uint k  = x & 0x07070707u;                       // magnitude code 0..7
++    const uint hi = (x >> 2) & 0x01010101u;                // k >= 4
++    const uint b1 = (x >> 1) & 0x01010101u;                // bit 1 of k
++    const uint m  = x & 0x01010101u;                       // mantissa bit
++    // k < 4: value = k. k >= 4: value = (4 + 2m) << b1  (4, 6, 8, 12)
++    uint t = 0x04040404u + (m << 1);
++    t += t & (b1 * 0xFFu);
++    uint v = k ^ ((k ^ t) & (hi * 0xFFu));
++    // sign: negate bytes with bit 3 set, except -0 (k == 0) which must stay 0
++    const uint s  = (x >> 3) & 0x01010101u;
++    const uint nz = ((k + 0x7F7F7F7Fu) >> 7) & 0x01010101u;
++    const uint sm = s & nz;
++    v = (v ^ (sm * 0xFFu)) + sm;
++    return vec4(unpack8(int(v)));
++}
++
++void calc_block(const uint a_offset, const uint b_offset, const uint sub, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
++    const uint y_idx = i * QUANT_K + 16 * sub;
++
++    vec4 b[NUM_COLS][4];
++    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++        const uint base = (j * p.batch_stride_b + b_offset + y_idx) / 4;
++        b[j][0] = vec4(data_b_v4[base + 0]);
++        b[j][1] = vec4(data_b_v4[base + 1]);
++        b[j][2] = vec4(data_b_v4[base + 2]);
++        b[j][3] = vec4(data_b_v4[base + 3]);
++    }
++
++    uint ibi = a_offset + first_row * num_blocks_per_row + i;
++    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++        const float d  = nvfp4_scale((data_a_packed32[ibi].d[0] >> (8u * sub)) & 0x7Fu) * 0.5;
++        const uint  w0 = data_a_packed32[ibi].qs[2 * sub];
++        const uint  w1 = data_a_packed32[ibi].qs[2 * sub + 1];
++        const vec4 v0 = nvfp4_vals(w0);        // elements 0..3
++        const vec4 v1 = nvfp4_vals(w1);        // elements 4..7
++        const vec4 v2 = nvfp4_vals(w0 >> 4);   // elements 8..11
++        const vec4 v3 = nvfp4_vals(w1 >> 4);   // elements 12..15
++        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++            const FLOAT_TYPE sum = FLOAT_TYPE(dot(b[j][0], v0) + dot(b[j][1], v1) + dot(b[j][2], v2) + dot(b[j][3], v3));
++            temp[j][n] = fma(FLOAT_TYPE(d), sum, temp[j][n]);
++        }
++        ibi += num_blocks_per_row;
++    }
++}
++
++
++// Two blocks per step: issue every load first, then decode, so each thread keeps more bytes in flight.
++void calc_block2(const uint a_offset, const uint b_offset, const uint sub, const uint i0, const uint i1, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
++    vec4 b[2][NUM_COLS][4];
++    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++        const uint base0 = (j * p.batch_stride_b + b_offset + i0 * QUANT_K + 16 * sub) / 4;
++        const uint base1 = (j * p.batch_stride_b + b_offset + i1 * QUANT_K + 16 * sub) / 4;
++        [[unroll]] for (uint k = 0; k < 4; ++k) {
++            b[0][j][k] = vec4(data_b_v4[base0 + k]);
++            b[1][j][k] = vec4(data_b_v4[base1 + k]);
++        }
++    }
++    uint dw[2][NUM_ROWS], w0[2][NUM_ROWS], w1[2][NUM_ROWS];
++    uint ibi0 = a_offset + first_row * num_blocks_per_row + i0;
++    uint ibi1 = a_offset + first_row * num_blocks_per_row + i1;
++    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++        dw[0][n] = data_a_packed32[ibi0].d[0];
++        w0[0][n] = data_a_packed32[ibi0].qs[2 * sub];
++        w1[0][n] = data_a_packed32[ibi0].qs[2 * sub + 1];
++        dw[1][n] = data_a_packed32[ibi1].d[0];
++        w0[1][n] = data_a_packed32[ibi1].qs[2 * sub];
++        w1[1][n] = data_a_packed32[ibi1].qs[2 * sub + 1];
++        ibi0 += num_blocks_per_row;
++        ibi1 += num_blocks_per_row;
++    }
++    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++        [[unroll]] for (uint q = 0; q < 2; ++q) {
++            const float d  = nvfp4_scale((dw[q][n] >> (8u * sub)) & 0x7Fu) * 0.5;
++            const vec4 v0 = nvfp4_vals(w0[q][n]);
++            const vec4 v1 = nvfp4_vals(w1[q][n]);
++            const vec4 v2 = nvfp4_vals(w0[q][n] >> 4);
++            const vec4 v3 = nvfp4_vals(w1[q][n] >> 4);
++            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++                const FLOAT_TYPE sum = FLOAT_TYPE(dot(b[q][j][0], v0) + dot(b[q][j][1], v1) + dot(b[q][j][2], v2) + dot(b[q][j][3], v3));
++                temp[j][n] = fma(FLOAT_TYPE(d), sum, temp[j][n]);
++            }
++        }
++    }
++}
++
++void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
++    uint a_offset, b_offset, d_offset;
++    get_offsets(a_offset, b_offset, d_offset);
++
++    const uint num_blocks_per_row = p.ncols / QUANT_K;
++
++    // 4 threads per 64-element block, one 16-element sub-block each
++    const uint blocks_per_wg = gl_WorkGroupSize.x / 4;
++    const uint tid = gl_LocalInvocationID.x;
++    const uint sub = tid % 4;
++    const uint ix  = tid / 4;
++
++    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
++        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
++            temp[j][i] = FLOAT_TYPE(0);
++        }
++    }
++
++    uint i = ix;
++    for (; i + blocks_per_wg < num_blocks_per_row; i += 2 * blocks_per_wg) {
++        calc_block2(a_offset, b_offset, sub, i, i + blocks_per_wg, num_blocks_per_row, first_row, num_rows);
++    }
++    if (i < num_blocks_per_row) {
++        calc_block(a_offset, b_offset, sub, i, num_blocks_per_row, first_row, num_rows);
++    }
++
++    reduce_result(temp, d_offset, first_row, num_rows, tid);
++}
++
++void main() {
++    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
++
++    // do NUM_ROWS at a time, unless there aren't enough remaining rows
++    if (first_row + NUM_ROWS <= p.stride_d) {
++        compute_outputs(first_row, NUM_ROWS);
++    } else {
++        if (first_row >= p.stride_d) {
++            return;
++        }
++        compute_outputs(first_row, p.stride_d - first_row);
++    }
++}

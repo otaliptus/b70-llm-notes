@@ -1,0 +1,43 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ba7f7eb..29bc851 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9654,6 +9654,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
+         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
++        test_cases.emplace_back(new test_relu_sqr(type, { 2560, 9, 1, 1 }));   // MoE relu^2 at decode (top-9 experts)
+     }
+ 
+     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
+@@ -12045,6 +12046,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // B70 / Nemotron 3.5 Bolt decode shapes (local kernel work): set BOLT_SHAPES=1 to get only these
++    if (getenv("BOLT_SHAPES")) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4,   GGML_TYPE_F32, 18560, 1, 4096, {1, 1}, {1, 1}));  // ssm_in
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4,   GGML_TYPE_F32,  4096, 1, 8192, {1, 1}, {1, 1}));  // ssm_out
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32,  5376, 1, 4096, {1, 1}, {1, 1}));  // shared expert up/gate
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32,  4096, 1, 5376, {1, 1}, {1, 1}));  // shared expert down
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,    GGML_TYPE_F32,  4096, 1, 4096, {1, 1}, {1, 1}));  // reference
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0,    GGML_TYPE_F32, 18560, 1, 4096, {1, 1}, {1, 1}));  // reference (ssmQ4_0 variant)
++        // batched copies so the weights exceed the L2 (>100 MB per run); per-run time / bs = per-matrix time
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4,   GGML_TYPE_F32, 18560, 1, 4096, {3, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4,   GGML_TYPE_F32,  4096, 1, 8192, {6, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32,  5376, 1, 4096, {20, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0,    GGML_TYPE_F32,  4096, 1, 4096, {6, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0,    GGML_TYPE_F32, 18560, 1, 4096, {3, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 240, 9, false, 1024, 1, 2048)); // expert up/gate
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 240, 9, false, 2048, 1, 1024)); // expert down
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 496, 9, false, 1024, 1, 2560));
++        // fused router (sigmoid, bias, norm) at decode: 1 token, 240..496 experts, top-9
++        test_cases.emplace_back(new test_topk_moe({240, 1, 1, 1}, 9, true, true, GATING_FUNC_SIGMOID, false));
++        test_cases.emplace_back(new test_topk_moe({496, 1, 1, 1}, 9, true, true, GATING_FUNC_SIGMOID, false));
++        test_cases.emplace_back(new test_topk_moe({512, 1, 1, 1}, 9, true, true, GATING_FUNC_SIGMOID, false));
++        return test_cases;
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

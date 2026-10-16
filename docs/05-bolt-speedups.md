@@ -84,7 +84,12 @@ bench score does not see the difference, perplexity does. The original stays the
 speed option. A Q6_K/Q8_0 requant would need `llama-quantize` for the type and is predicted slower (Q8_0 reads 2x
 the bytes of NVFP4).
 
-## What is left
+## Kernel work (later the same day)
+`09-vulkan-kernels.md`: an IQ2_XXS integer-dot path, a dedicated NVFP4 shader, a router fix and a fused relu^2 took
+plain decode to 51 tok/s and the DFlash configuration to a 64 tok/s median over the 39 tasks (34/39), with unchanged
+perplexity. The list below is what was still open before that work.
+
+## What was left at this point
 Kernel work in llama.cpp's Vulkan backend, not settings: a better NVFP4 mat-vec (or a Q4_0-style dequant with the
 16-element scales kept), fusing the ~760 per-token elementwise ops in the Mamba blocks, and the IQ2_XXS mat-vec /
 mat_id, which runs at roughly a quarter of peak bandwidth. Intel's own upstream Vulkan PRs for mat-vec geometry

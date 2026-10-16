@@ -18,6 +18,15 @@ Measured and rejected, with the number that killed each one.
 - Upstream Intel Vulkan PRs for mat-vec geometry: stale drafts; the mergeable one is flash-attention prefill only.
   The PREC_F32 MUL_MAT_ID CPU-fallback fix applies to a different architecture.
 
+## Vulkan kernel work (see 09)
+- Subgroup-lane lookup table via `subgroupShuffle` for the NVFP4 decode: 2.7x slower than arithmetic on Intel.
+- Integer-dot NVFP4 with shared-memory tables: 920 "sends", slower than the float path.
+- Integer-dot NVFP4 with SIMD-within-register decode: kernel 15 % faster, model 2.5 % slower (extra Q8_1 quantize dispatch per projection).
+- Arithmetic decode inside the generic mat-vec, dropping the shared-table init barrier, 2-block unroll with hoisted loads, subgroup 32, large workgroups, every rows-per-workgroup setting: no change for NVFP4.
+- Q8_0 on the integer path at n=1 (upstream default for k >= 2048 on Intel): 4 µs slower per call than the float path.
+- `test-backend-ops perf` without L2-defeating batch sizes: 2x optimistic for anything under ~25 MB.
+- `GGML_VK_PERF_LOGGER` inside the Mesa 26.2.4 container: op times inflated 3-10x (timestamps distort); profile on the host driver.
+
 ## Orca 27B (OrcaSAQ-2-Cyber-27B, dense)
 - IQ4_XS and IQ3_M quants on Intel: 11-13 tok/s decode (IQ dequant paths are slow on both backends here).
 - Q4_0 and Q3_K_M requants: 3-4 % perplexity for no speed gain over Q4_K_S.

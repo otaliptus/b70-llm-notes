@@ -1,0 +1,90 @@
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp b/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp
+index d219201..51f5533 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/topk_moe.comp
+@@ -107,35 +107,37 @@ void main() {
+         probs[i] = -INFINITY;
+     }
+ 
++    // Loops below run over the compile-time experts_per_thread (not the runtime n_experts) so that probs[] /
++    // selection_probs[] are indexed statically; a runtime trip count forced them into scratch memory (~10x slower).
+     [[unroll]]
+-    for (uint i = 0; i < n_experts; i += WARP_SIZE) {
+-        const uint expert = i + lane;
+-        probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[logits_offset + expert] : -INFINITY;
++    for (uint i = 0; i < experts_per_thread; i++) {
++        const uint expert = i * WARP_SIZE + lane;
++        probs[i] = (expert < n_experts) ? logits[logits_offset + expert] : -INFINITY;
+     }
+ 
+     if (gating_func == GATING_FUNC_SOFTMAX) {
+         softmax_warp_inplace(probs, n_experts, lane, nexperts_use_push);
+     } else if (gating_func == GATING_FUNC_SIGMOID) {
+         [[unroll]]
+-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
+-            const uint expert = i + lane;
+-            probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? 1.f / (1.f + exp(-probs[i / WARP_SIZE])) : -INFINITY;
++        for (uint i = 0; i < experts_per_thread; i++) {
++            const uint expert = i * WARP_SIZE + lane;
++            probs[i] = (expert < n_experts) ? 1.f / (1.f + exp(-probs[i])) : -INFINITY;
+         }
+     } else if (gating_func == GATING_FUNC_SQRT_SOFTPLUS) {
+         [[unroll]]
+-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
+-            const uint expert = i + lane;
+-            const float val = probs[i / WARP_SIZE];
+-            probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? sqrt(val > 20.0f ? val : log(1.0f + exp(val))) : -INFINITY;
++        for (uint i = 0; i < experts_per_thread; i++) {
++            const uint expert = i * WARP_SIZE + lane;
++            const float val = probs[i];
++            probs[i] = (expert < n_experts) ? sqrt(val > 20.0f ? val : log(1.0f + exp(val))) : -INFINITY;
+         }
+     }
+ 
+     float selection_probs[experts_per_thread];
+     if (has_bias != 0) {
+         [[unroll]]
+-        for (uint i = 0; i < n_experts; i += WARP_SIZE) {
+-            const uint expert = i + lane;
+-            selection_probs[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? probs[i / WARP_SIZE] + bias[bias_offset + expert] : -INFINITY;
++        for (uint i = 0; i < experts_per_thread; i++) {
++            const uint expert = i * WARP_SIZE + lane;
++            selection_probs[i] = (expert < n_experts) ? probs[i] + bias[bias_offset + expert] : -INFINITY;
+         }
+     } else {
+         [[unroll]]
+@@ -163,11 +165,11 @@ void main() {
+         uint   max_expert = lane;
+ 
+         [[unroll]]
+-        for (uint i = WARP_SIZE; i < n_experts; i += WARP_SIZE) {
+-            const uint expert = i + lane;
+-            if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_probs[i / WARP_SIZE] > max_val_s) {
+-                max_val    = probs[i / WARP_SIZE];
+-                max_val_s  = selection_probs[i / WARP_SIZE];
++        for (uint i = 1; i < experts_per_thread; i++) {
++            const uint expert = i * WARP_SIZE + lane;
++            if ((expert < n_experts) && selection_probs[i] > max_val_s) {
++                max_val    = probs[i];
++                max_val_s  = selection_probs[i];
+                 max_expert = expert;
+             }
+         }
+@@ -185,11 +187,15 @@ void main() {
+         }
+ 
+         if ((k & (WARP_SIZE - 1)) == lane) {
+-            output_weights[k / WARP_SIZE] = max_val;
++            [[unroll]] for (uint i = 0; i < experts_per_thread; i++) {   // static index: k / WARP_SIZE
++                if (i == k / WARP_SIZE) { output_weights[i] = max_val; }
++            }
+         }
+ 
+         if ((max_expert & (WARP_SIZE - 1)) == lane) {
+-            selection_probs[max_expert / WARP_SIZE] = -INFINITY;
++            [[unroll]] for (uint i = 0; i < experts_per_thread; i++) {   // static index: max_expert / WARP_SIZE
++                if (i == max_expert / WARP_SIZE) { selection_probs[i] = -INFINITY; }
++            }
+ 
+             ids[ids_offset + k] = max_expert;
+             wt_sum += max_val;
