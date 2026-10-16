@@ -1,0 +1,2 @@
+FROM debian:sid-slim
+RUN apt-get update && apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 libvulkan-dev vulkan-tools glslc glslang-tools glslang-dev spirv-headers spirv-tools cmake ninja-build g++ git ca-certificates libgomp1 libcurl4-openssl-dev python3 && rm -rf /var/lib/apt/lists/* && glslc --version | head -2 && cmake --version | head -1

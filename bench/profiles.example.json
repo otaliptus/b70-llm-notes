@@ -1,0 +1,6 @@
+{
+  "fn": {"url": "http://127.0.0.1:18080/v1", "key_file": "~/inference.key", "model": "qwen3.8-flash-next-iq3_s",
+         "base_extra": {"experimental_speed_projection": false}},
+  "sw": {"url": "http://127.0.0.1:8081/v1", "key": "bench", "model": "swift-1.5-iq3_s"},
+  "bolt": {"url": "http://127.0.0.1:18081/v1", "key_file": "~/inference.key", "model": "nemotron-3.5-bolt-74b-a9b"}
+}
