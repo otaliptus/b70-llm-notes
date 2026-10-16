@@ -18,7 +18,7 @@ Measured and rejected, with the number that killed each one.
 - Upstream Intel Vulkan PRs for mat-vec geometry: stale drafts; the mergeable one is flash-attention prefill only.
   The PREC_F32 MUL_MAT_ID CPU-fallback fix applies to a different architecture.
 
-## Dense 27B
+## Orca 27B (OrcaSAQ-2-Cyber-27B, dense)
 - IQ4_XS and IQ3_M quants on Intel: 11-13 tok/s decode (IQ dequant paths are slow on both backends here).
 - Q4_0 and Q3_K_M requants: 3-4 % perplexity for no speed gain over Q4_K_S.
 - Flash attention off: prefill at depth drops 847 -> 614.

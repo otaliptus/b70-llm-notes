@@ -12,7 +12,7 @@ COMMON=(--url "http://127.0.0.1:$PORT/v1" --key "$KEY" --model "$MODEL_ID")
 LOG=$BENCH/results/run_$PREFIX.log
 pid=
 serve() { setsid nohup "$SERVE" "$@" > "$BENCH/results/$PREFIX-server.log" 2>&1 & pid=$!; }
-stop() { [ -n "$pid" ] && kill "$pid" 2>/dev/null; docker stop -t 30 bolt-sycl dense-sycl lfm-sycl >/dev/null 2>&1; sleep 5; pid=; }
+stop() { [ -n "$pid" ] && kill "$pid" 2>/dev/null; docker stop -t 30 bolt-sycl orca-sycl lfm-sycl >/dev/null 2>&1; sleep 5; pid=; }
 run() { local name=$1; shift
   echo "=== $(date '+%H:%M') $name" >> "$LOG"
   python3 "$@" --name "$name" "${COMMON[@]}" "${SAMP[@]}" --wait 900 >> "$BENCH/results/$name.log" 2>&1

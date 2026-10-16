@@ -11,7 +11,7 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 2. **The faster backend depends on the model.** For a dense 27B Q4_K_S, SYCL gives 2.4x the prefill and +10-30 %
    decode over Vulkan. For Nemotron 3.5 Bolt (hybrid Mamba-2 + MoE, IQ2_XXS + NVFP4) Vulkan gives +45 % decode and
    the DFlash drafter at draft length 3 another +20 %: 29 -> 50 tok/s, same score, 1.7x less wall time.
-   [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md), [`docs/06-dense-model-sycl.md`](docs/06-dense-model-sycl.md)
+   [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md), [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
@@ -23,7 +23,7 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/03-results.md`](docs/03-results.md) | all models, all scenarios, speeds |
 | [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md) | the budget finding |
 | [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md) | SYCL -> Vulkan -> DFlash -> requant on Nemotron 3.5 Bolt, with the per-op profile |
-| [`docs/06-dense-model-sycl.md`](docs/06-dense-model-sycl.md) | dense 27B: backend, MTP drafting, imatrix quant study, 262k KV, power cap |
+| [`docs/06-orca-27b-sycl.md`](docs/06-orca-27b-sycl.md) | dense 27B: backend, MTP drafting, imatrix quant study, 262k KV, power cap |
 | [`docs/07-strata-notes.md`](docs/07-strata-notes.md) | Strata engine on Battlemage: AOT build, kv-resident 262k, sampling, control vector |
 | [`docs/08-dead-ends.md`](docs/08-dead-ends.md) | everything measured and rejected, with numbers |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
@@ -43,3 +43,6 @@ python3 bench/report.py                               # bench/results/report.md
 Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), a dense Qwen3-based 27B (Q4_K_S), LiquidAI
 LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541 and
 b11669. Dates 2026-10-10 to 2026-10-16.
+
+## License
+MIT, see [`LICENSE`](LICENSE).

@@ -21,8 +21,8 @@ cmake and ninja, so the same image builds patched llama.cpp trees (`scripts/buil
 runtime libraries but no headers, hence `-DGGML_SYCL_DNN=OFF` in the build.
 
 **Vulkan (Mesa ANV).** The official `...-bin-ubuntu-vulkan-x64` archive runs directly on the host. No container.
-Which backend is faster depends on the model (see `06-dense-model-sycl.md` vs `05-bolt-speedups.md`): SYCL won
-2.4x on prefill and 10-30 % on decode for a dense 27B Q4_K_S model, Vulkan won 45 % on decode for a hybrid
+Which backend is faster depends on the model (see `06-orca-27b-sycl.md` vs `05-bolt-speedups.md`): SYCL won
+2.4x on prefill and 10-30 % on decode for Orca 27B, a dense Q4_K_S model, Vulkan won 45 % on decode for a hybrid
 Mamba-2 / MoE model whose tensors are IQ2_XXS and NVFP4.
 
 **Newer Mesa in a container.** A Debian sid container (`scripts/mesa-sid/`) gives Mesa 26.2.x and a current glslc

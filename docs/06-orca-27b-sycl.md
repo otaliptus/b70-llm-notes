@@ -1,6 +1,6 @@
-# A dense 27B on the B70: Vulkan -> SYCL, drafting, quant, KV, power
+# OrcaSAQ-2-Cyber-27B on the B70: Vulkan -> SYCL, drafting, quant, KV, power
 
-The model here is a dense Qwen3-based 27B fine-tune distributed as IQ4_XS (imatrix). Everything applies to any
+The model here is OrcaSAQ-2-Cyber-27B, a dense Qwen3-based 27B fine-tune distributed as IQ4_XS (imatrix). Everything applies to any
 dense 20-35B GGUF on this card.
 
 ## Backend: SYCL wins for dense models
