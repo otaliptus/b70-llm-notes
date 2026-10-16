@@ -22,3 +22,5 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   direction at runtime. The `proj` benchmark scenario measured it: 36/39 vs 34 with it off, within noise, i.e. no
   measurable cost on these tasks (the vector's own metadata reports mean KL 0.19 vs the stock model). Requests can
   opt out per call with `"experimental_speed_projection": false`, which the bench does for the "stock" rows.
+- **MTP draft length** (`--spec N`): 3, 4 and 5 measured 41-50 tok/s on the same four prompts with the 2048 budget;
+  the differences are noise, so the default 4 stays (unlike llama.cpp's DFlash drafter on Bolt, where 3 was clearly best).
