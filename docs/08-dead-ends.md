@@ -35,6 +35,10 @@ Measured and rejected, with the number that killed each one.
 - f16 KV at 262k: does not fit beside the model.
 - `--cache-reuse`: unsupported for the hybrid-attention architecture.
 
+## Strata
+- Draft length 3 or 5 instead of 4: within noise (41-50 tok/s on the same prompts).
+- Updating to 0.1.44.1: no engine change for the B70; speed identical.
+
 ## Thinking budgets
 - Unlimited thinking: 6-12 of 39 answers lost to the output limit, 2-4x the wall time.
 - Soft `reasoning_effort: low`: tail of capped answers remains, wall time barely improves.
