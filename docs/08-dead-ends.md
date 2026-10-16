@@ -35,6 +35,21 @@ Measured and rejected, with the number that killed each one.
 - f16 KV at 262k: does not fit beside the model.
 - `--cache-reuse`: unsupported for the hybrid-attention architecture.
 
+## SYCL speculative path / K-quant kernels (see 10)
+- Every SYCL runtime knob (graphs, fusion, ESIMD, wide MMVQ, DMMV priority, reorder, dynamic precision, oneDNN/MKL
+  flash attention, f16 KV) for Orca plain decode: all within +-0.5 % of 29.4 tok/s; fusion off -4 %, ESIMD off -6 %.
+  SYCL graphs are compiled in and enabled by the env var but change nothing here.
+- Draft length 4 or 5 (greedy or probabilistic): slower than 3 both before and after the kernel work; each verified
+  column costs ~25 % of a token.
+- Pre-decoding Q4_K weights and hoisting the activation-sum term alone: Q6_K -24 %, Q5_K -12 %, Q4_K +-0 % at n=4 (the
+  compiler had already hoisted it); the Q4_K gains needed more rows per sub-group.
+- Four rows per sub-group for every type and size: Q6_K n=3..6 +11..43 % slower, 48..1024-row matrices +35 %, and the
+  fused gate+up kernel spills (up to 3.7 KB); kept only for Q4_K/Q5_K with >= 4096 rows, GLU fusion limited to <= 2
+  columns.
+- `-ze-opt-large-register-file` at JIT time: n=8 shapes -30 %, the dominant n=4 shapes +-0; not adopted.
+- The dequant + XMX GEMM path for 9..64 columns: 3x slower per token than MMVQ at 8 (batched-bench B=12 collapses
+  to 33 t/s aggregate); keep speculative batches at <= 8 tokens on this backend.
+
 ## Strata
 - Draft length 3 or 5 instead of 4: within noise (41-50 tok/s on the same prompts).
 - Updating to 0.1.44.1: no engine change for the B70; speed identical.

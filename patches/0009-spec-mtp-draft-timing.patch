@@ -1,0 +1,58 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d8afd40..52002ee 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1466,6 +1466,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // local timing instrumentation (SPEC_TIMING env): where the drafting time goes
++    int64_t tm_proc_us = 0, tm_ddec_us = 0, tm_dsmp_us = 0; int64_t tm_n_proc = 0, tm_n_draft = 0, tm_n_steps = 0;
++    bool tm_on = getenv("SPEC_TIMING") != nullptr;
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1652,7 +1656,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
++                const int64_t tm0 = ggml_time_us();
+                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++                if (tm_on) { llama_synchronize(ctx_dft); tm_proc_us += ggml_time_us() - tm0; tm_n_proc++; }
+                 if (rc != 0) {
+                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+@@ -1691,6 +1697,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void draft(common_speculative_draft_params_vec & dparams) override {
++        if (tm_on && ++tm_n_draft % 64 == 0) {
++            fprintf(stderr, "SPEC_TIMING draft calls %lld: process %.1f ms/call (%lld) | draft decode %.2f ms/step (%lld steps, %.2f steps/call) | draft sample %.2f ms/step\n",
++                    (long long) tm_n_draft, tm_n_proc ? tm_proc_us / 1000.0 / tm_n_proc : 0.0, (long long) tm_n_proc,
++                    tm_n_steps ? tm_ddec_us / 1000.0 / tm_n_steps : 0.0, (long long) tm_n_steps, (double) tm_n_steps / tm_n_draft,
++                    tm_n_steps ? tm_dsmp_us / 1000.0 / tm_n_steps : 0.0);
++        }
+         auto & ctx_dft = params.ctx_dft;
+ 
+         batch.clear();
+@@ -1752,7 +1764,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+             }
+ 
++            const int64_t tm1 = ggml_time_us();
+             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++            if (tm_on) { llama_synchronize(ctx_dft); tm_ddec_us += ggml_time_us() - tm1; tm_n_steps++; }
+             if (ret != 0) {
+                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                 break;
+@@ -1770,7 +1784,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
++                const int64_t tm2 = ggml_time_us();
+                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                if (tm_on) { tm_dsmp_us += ggml_time_us() - tm2; }
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);

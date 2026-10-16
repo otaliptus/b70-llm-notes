@@ -1,0 +1,46 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b503646..8f1358e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12048,6 +12048,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // B70 / Qwen3.5-27B-class dense hybrid decode shapes (local kernel work): set ORCA_SHAPES=1 to get only these
++    if (getenv("ORCA_SHAPES")) {
++        // n-curve of the three dominant shapes (spec verify is 2..8 columns)
++        for (int n : {2, 3, 6, 8}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  17408, n,  5120, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   5120, n, 17408, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n,  5120, {1, 1}, {1, 1}));
++        }
++        for (int n : {1, 4}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  17408, n,  5120, {1, 1}, {1, 1}));  // ffn_gate / ffn_up
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,   5120, n, 17408, {1, 1}, {1, 1}));  // ffn_down
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  12288, n,  5120, {1, 1}, {1, 1}));  // attn_q (full-attn layers)
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  10240, n,  5120, {1, 1}, {1, 1}));  // attn_qkv (delta-net layers)
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   6144, n,  5120, {1, 1}, {1, 1}));  // attn_gate
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   5120, n,  6144, {1, 1}, {1, 1}));  // ssm_out / attn_output
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   1024, n,  5120, {1, 1}, {1, 1}));  // attn_k
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,     48, n,  5120, {1, 1}, {1, 1}));  // ssm_alpha / ssm_beta
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, n,  5120, {1, 1}, {1, 1}));  // output (lm head)
++        }
++        // batched copies so the weights exceed the L2 (>100 MB per run); per-run time / bs = per-matrix time
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 17408, 1,  5120, {3, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32,  5120, 1, 17408, {3, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 12288, 1,  5120, {4, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 10240, 1,  5120, {4, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  6144, 1,  5120, {8, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5120, 1,  6144, {8, 1}, {1, 1}));
++        // gated delta net recurrence: 48 heads x 128, 1 token (decode) and 4 tokens (spec verify)
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 1, 1));
++        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 4, 1));
++        // depthwise conv over the qkv projection, kernel 4
++        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, 10240, 1, 1}, {4, 10240, 1, 1}));
++        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {7, 10240, 1, 1}, {4, 10240, 1, 1}));
++        return test_cases;
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
