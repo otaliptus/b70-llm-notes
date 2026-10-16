@@ -1,0 +1,25 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 436bfe3..2358383 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2875,12 +2875,20 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+         rm_stdq = 2;
+         rm_stdq_int = 2;
++        // experiment knobs (B70 tuning): rows per workgroup for the dequant mat-vec shaders
++        if (const char * e = getenv("GGML_VK_INTEL_RM_STDQ")) { rm_stdq = atoi(e); rm_stdq_int = atoi(e); }
++        if (const char * e = getenv("GGML_VK_INTEL_RM_KQ"))   { rm_kq = atoi(e); rm_kq_int = atoi(e); }
+     }
++    const char * intel_rm_id_env = device->vendor_id == VK_VENDOR_ID_INTEL ? getenv("GGML_VK_INTEL_RM_ID") : nullptr;
++    const uint32_t intel_rm_id = intel_rm_id_env ? atoi(intel_rm_id_env) : 0;
+     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
+     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
+     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
+     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
+     auto const &rm_id = [&](uint32_t rows) {
++        if (intel_rm_id) {
++            return intel_rm_id;
++        }
+         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+             device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) {
+             return 4u;

@@ -1,0 +1,6 @@
+__pycache__/
+bench/results/*.json
+bench/results/*.log
+bench/results/ppl-text.txt
+bench/profiles.json
+*.gguf

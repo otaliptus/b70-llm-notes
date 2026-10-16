@@ -1,0 +1,45 @@
+# Local LLMs on an Intel Arc Pro B70: benchmark, speedups, notes
+
+Working notes from two weeks of running 20-80B open-weight models on a single Intel Arc Pro B70 (32 GB) with
+llama.cpp (SYCL and Vulkan backends) and Strata, plus the small benchmark harness used to compare them. Everything
+here is generic: no personal paths, keys or hostnames; scripts take their locations from environment variables.
+
+## Three results worth knowing
+1. **A hard thinking budget (~2048 tokens) beats unlimited thinking** for every Qwen-family reasoning model tried:
+   higher score *and* 2-4x less wall time, because unlimited runs regularly think to the output limit and never
+   answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md)
+2. **The faster backend depends on the model.** For a dense 27B Q4_K_S, SYCL gives 2.4x the prefill and +10-30 %
+   decode over Vulkan. For Nemotron 3.5 Bolt (hybrid Mamba-2 + MoE, IQ2_XXS + NVFP4) Vulkan gives +45 % decode and
+   the DFlash drafter at draft length 3 another +20 %: 29 -> 50 tok/s, same score, 1.7x less wall time.
+   [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md), [`docs/06-dense-model-sycl.md`](docs/06-dense-model-sycl.md)
+3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
+   requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
+
+## Layout
+| path | what |
+|---|---|
+| [`docs/01-environment.md`](docs/01-environment.md) | hardware, drivers, the two backends, container setup, gotchas |
+| [`docs/02-benchmark.md`](docs/02-benchmark.md) | the 39-task + multi-turn + repair + long-context harness and how to run it |
+| [`docs/03-results.md`](docs/03-results.md) | all models, all scenarios, speeds |
+| [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md) | the budget finding |
+| [`docs/05-bolt-speedups.md`](docs/05-bolt-speedups.md) | SYCL -> Vulkan -> DFlash -> requant on Nemotron 3.5 Bolt, with the per-op profile |
+| [`docs/06-dense-model-sycl.md`](docs/06-dense-model-sycl.md) | dense 27B: backend, MTP drafting, imatrix quant study, 262k KV, power cap |
+| [`docs/07-strata-notes.md`](docs/07-strata-notes.md) | Strata engine on Battlemage: AOT build, kv-resident 262k, sampling, control vector |
+| [`docs/08-dead-ends.md`](docs/08-dead-ends.md) | everything measured and rejected, with numbers |
+| [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
+| [`scripts/`](scripts/) | serve / build / sweep / profile / requant / perplexity scripts |
+| [`patches/`](patches/) | two llama.cpp (b11669) patches: SYCL `out_prod` strided f32 fix (makes DFlash run on SYCL), Vulkan Intel rows-per-workgroup env knobs (for experiments) |
+
+## Quick start
+```sh
+export MODELS_DIR=/path/to/ggufs LLAMA_RT=/path/to/llama.cpp-vulkan-release API_KEY_FILE=~/inference.key
+scripts/serve-bolt-vulkan.sh 2048 dflash              # Bolt, budget 2048, DFlash n=3, port 18081
+cp bench/profiles.example.json bench/profiles.json    # endpoints and model ids
+python3 bench/reference.py                            # the hidden tests are satisfiable
+python3 bench/run_bench.py --name bolt-b2048 --url http://127.0.0.1:18081/v1 --key "$(cat ~/inference.key)" \
+        --model nemotron-3.5-bolt-74b-a9b --temperature 1.0 --top-p 0.95 --top-k 0
+python3 bench/report.py                               # bench/results/report.md
+```
+Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), a dense Qwen3-based 27B (Q4_K_S), LiquidAI
+LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541 and
+b11669. Dates 2026-10-10 to 2026-10-16.
