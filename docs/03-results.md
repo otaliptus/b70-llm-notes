@@ -56,6 +56,8 @@ an `undo`.
 | Strata (Flash-Next / Swift) | 1,180 at 15k prompt (was 250-525 before 0.1.44) | 47-48 at 0-15k depth | per-request budgets, control vector optional |
 | Orca 27B, llama.cpp Vulkan b10430 (start) | 517 (pp2048) | 25 | |
 | Orca 27B, llama.cpp SYCL b11541 | 1,259 (pp2048), 1,009 at 32k depth | 28 plain, 37 with MTP + n-gram | see 06 |
+| Orca 27B, llama.cpp SYCL b11696 | 1,126 (pp512; b11541: 906) | 29.6 plain, 36-49 with MTP + n-gram | "wide stores for the q4_K/q5_K dequant" landed upstream; Vulkan (patched) is 686 / 27.4, so SYCL stays |
+| LFM2.5 Q6_K, SYCL b11696 | 1,951 (pp512) | 148.6 (llama-bench) | Vulkan: 2,605 / 126; SYCL stays for decode |
 | LFM2.5 Q6_K, SYCL | – | 128 | ttft 0.2 s |
 | Bolt, SYCL b11669 | 624 (pp512) | 29.7 | flat under every toggle |
 | Bolt, Vulkan b11669 host | 777 | 41.9 | |
