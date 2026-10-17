@@ -141,6 +141,13 @@ included. So the lab now serves Orca with a 512 budget. Caveat: this is one 16-t
 the pass@1 spread (8..13 at the same budget) is why single-run comparisons of budgets mislead, and the earlier
 "2048 beats unlimited" finding (04) is about the cap vs no cap, not about where below 2048 the cap should sit.
 
+**Agent-level check (scripted harness in the VM, 6 small coding tasks per run, per-request budgets).** Five runs,
+every one 6 of 6 with no tool errors or compactions: patched runtime 2.9 min at 52.8 tok/s (512 budget), official 2.9
+and 3.1 min at 46.5 tok/s (512), patched 2.7 min at 768 and 3.3 min at 2048. Agent traffic sees the +8-13 % tok/s; the
+wall time per run moves with the +-10 % swing in generated tokens, so at this task size no time-to-answer gain is
+demonstrated and no regression either. The tasks are too easy to separate budgets or runtimes by pass rate; that is what
+the repair suite above is for.
+
 ## 6. Things that did not work (details in 08)
 Four rows per sub-group everywhere (Q6_K and small matrices got slower; the fused GLU kernel spilled), the large
 register file JIT option (helps n=8 by 30 % but not the dominant n=4 shapes; also halves resident threads), and the
