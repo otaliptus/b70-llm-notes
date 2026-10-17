@@ -24,7 +24,9 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    Validated on the full 39-task suite in the served configuration (768 budget), two alternating pairs: 48.8 / 47.5
    vs 41.8 / 42.8 tok/s median, 13.2 / 13.3 vs 14.8 / 15.3 min wall, same pass rate; long-context suite 21/21 on both
    with +11-15 % decode at 8-64k; plain decode and perplexity unchanged. One trap: build the SYCL backend *with*
-   oneDNN or prefill at depth loses 16 %. [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
+   oneDNN or prefill at depth loses 16 %. Thinking budget, three rounds each on a 16-task repair suite: 512 passes
+   as many tasks as 2048 (13-14 of 16 after repairs) in 44 % of the wall time, so the agent now runs at 512.
+   [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
