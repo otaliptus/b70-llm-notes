@@ -126,10 +126,20 @@ adaptive capped at 3 = 45.9 (picked 2 and 3 about equally), adaptive capped at 4
 this card and model; the policy stays in the patch as an experiment, off by default.
 
 **Thinking budget vs tasks per minute** (multi-turn repair suite, 16 tasks, pass@1 / pass@3 after up to 2 repairs,
-per-request `reasoning_budget_tokens`, first round, single runs): 512 -> 12 / 14 in 10 min; 768 -> 8 / 12 in 16
-min; 1024 -> 10 / 14 in 17 min; 2048 -> 13 / 14 in 24 min. The non-monotonic 768 shows the single-run variance;
-repeats are running before any recommendation. What is already visible: 512 reaches the 2048 final pass count in
-less than half the wall time.
+per-request `reasoning_budget_tokens`, three alternating rounds for 512 / 768 / 2048, one for 1024):
+
+| budget | pass@1 (runs) | pass@3 (runs) | wall (runs) | pass@3 tasks / min |
+|---|---|---|---|---|
+| 512 | 12, 10, 11 | 14, 13, 13 | 10, 12, 11 min | 1.21 |
+| 768 (previous lab setting) | 8, 11, 10 | 12, 12, 14 | 16, 13, 12 min | 0.93 |
+| 1024 | 10 | 14 | 17 min | 0.82 |
+| 2048 | 13, 10, 11 | 14, 13, 15 | 24, 28, 23 min | 0.56 |
+
+The final pass counts differ by at most one task between budgets, which is the run-to-run spread of a single budget;
+the wall time is not: 512 delivers the same passed tasks in 44 % of the 2048 time and 80 % of the 768 time, repairs
+included. So the lab now serves Orca with a 512 budget. Caveat: this is one 16-task repair suite at temperature 1.0;
+the pass@1 spread (8..13 at the same budget) is why single-run comparisons of budgets mislead, and the earlier
+"2048 beats unlimited" finding (04) is about the cap vs no cap, not about where below 2048 the cap should sit.
 
 ## 6. Things that did not work (details in 08)
 Four rows per sub-group everywhere (Q6_K and small matrices got slower; the fused GLU kernel spilled), the large
