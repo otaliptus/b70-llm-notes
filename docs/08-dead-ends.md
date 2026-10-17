@@ -47,6 +47,11 @@ Measured and rejected, with the number that killed each one.
   fused gate+up kernel spills (up to 3.7 KB); kept only for Q4_K/Q5_K with >= 4096 rows, GLU fusion limited to <= 2
   columns.
 - `-ze-opt-large-register-file` at JIT time: n=8 shapes -30 %, the dominant n=4 shapes +-0; not adopted.
+- Draft length 2 (probabilistic): 44.9 vs 47.7 / 46.5 tok/s for length 3 on the speed subset.
+- Adaptive draft length by expected tokens per step time (patch 0009, `SPEC_ADAPTIVE=1`): 45.9 (cap 3) and 47.7
+  (cap 4) vs fixed 3 at 47.7 / 46.5; the fixed length was already at the model's optimum for this acceptance rate.
+- Building the SYCL backend without oneDNN (`GGML_SYCL_DNN=OFF`, the easy way in a runtime-only image): prefill at
+  32k depth 692 vs 911 tok/s. Mount the oneDNN devel headers and build with DNN on.
 - The dequant + XMX GEMM path for 9..64 columns: 3x slower per token than MMVQ at 8 (batched-bench B=12 collapses
   to 33 t/s aggregate); keep speculative batches at <= 8 tokens on this backend.
 

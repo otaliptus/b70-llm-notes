@@ -21,9 +21,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    (exact target distribution) takes it to 51-69 % and 36 -> 42 tok/s. The 4-token verify then cost 1.8x a single
    token because the K-quant multi-column kernels were issue-bound; four rows per sub-group, uniform scale loads and
    an un-fused gate/up at n >= 3 make 4-column mat-vecs 20-40 % faster (deterministic: batched-bench B=4 +12 %).
-   Served, on a 4-task subset at a 2048 budget, one run each: 41.9 -> 47.7 tok/s median and 160 -> 135 s total wall;
-   plain decode unchanged; no regression detected in 2273 op tests and an 8-chunk perplexity A/B. Not yet measured on
-   the full suite, at depth, or in the agent configuration. [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
+   Validated on the full 39-task suite in the served configuration (768 budget), two alternating pairs: 48.8 / 47.5
+   vs 41.8 / 42.8 tok/s median, 13.2 / 13.3 vs 14.8 / 15.3 min wall, same pass rate; long-context suite 21/21 on both
+   with +11-15 % decode at 8-64k; plain decode and perplexity unchanged. One trap: build the SYCL backend *with*
+   oneDNN or prefill at depth loses 16 %. [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
@@ -39,7 +40,8 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/07-strata-notes.md`](docs/07-strata-notes.md) | Strata engine on Battlemage: AOT build, kv-resident 262k, sampling, control vector |
 | [`docs/08-dead-ends.md`](docs/08-dead-ends.md) | everything measured and rejected, with numbers |
 | [`docs/09-vulkan-kernels.md`](docs/09-vulkan-kernels.md) | llama.cpp Vulkan kernel work: IQ2_XXS int8 dot, dedicated NVFP4 shader, router fix; 42 -> 51 tok/s plain decode |
-| [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md) | llama.cpp SYCL: where a speculative step goes, probabilistic MTP drafting, faster multi-column K-quant mat-vecs; 36 -> 48 tok/s served |
+| [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md) | llama.cpp SYCL: where a speculative step goes, probabilistic MTP drafting, faster multi-column K-quant mat-vecs, full-suite validation, the oneDNN build trap; 36 -> 48 tok/s served |
+| [`docs/11-agent-context-management.md`](docs/11-agent-context-management.md) | keeping a local agent fast over long sessions: compaction point, durable notes, tool logs on disk, stable prefixes, per-request thinking budgets, what to count |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
 | [`scripts/`](scripts/) | serve / build / sweep / profile / requant / perplexity scripts |
 | [`patches/`](patches/) | llama.cpp patches. b11669: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes. b11696: SYCL K-quant multi-column mat-vecs (0008), MTP draft timing (0009), Qwen3.5-class perf shapes (0010) |
@@ -56,7 +58,7 @@ python3 bench/report.py                               # bench/results/report.md
 ```
 Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), OrcaSAQ-2-Cyber-27B (Q4_K_S), LiquidAI
 LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541,
-b11669 and b11696. Dates 2026-10-10 to 2026-10-16.
+b11669 and b11696. Dates 2026-10-10 to 2026-10-17.
 
 ## License
 MIT, see [`LICENSE`](LICENSE).

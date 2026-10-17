@@ -97,7 +97,41 @@ same 8x512 tokens, official vs patched: 6.6087 vs 6.6117 at ubatch 1, 6.6217 vs 
 reorder float accumulation by construction, so results are close, not bit-identical; eight chunks bound gross errors
 only.
 
-## 5. Things that did not work (details in 08)
+## 5. Validation (2026-10-17): full suite, alternating runs, lab configuration
+Reviewer feedback on the first write-up was that the headline rested on four short tasks at a 2048 budget. So: the
+full 39-task suite in the served configuration (768-token budget, probabilistic MTP n-max 3), runtimes alternated
+patched / official / patched / official to spread clock and order effects, plus the long-context suite once each.
+
+| run | pass | median tok/s | wall | passed tasks / min |
+|---|---|---|---|---|
+| patched #1 / #2 | 33 / 31 | 48.8 / 47.5 | 13.2 / 13.3 min | 2.50 / 2.33 |
+| official #1 / #2 | 32 / 33 | 41.8 / 42.8 | 14.8 / 15.3 min | 2.17 / 2.16 |
+
+Identical-configuration noise: ~1 tok/s, ~0.5 min, 2 passes. The runtime effect (+12-17 % throughput, 11-13 % less
+wall, similar token counts, no pass-rate difference) is well outside it. Long-context suite (7 items at 8k / 32k /
+64k): 21/21 on both; decode with drafting +14 / +11 / +15 % at 8k / 32k / 64k (31 vs 27 tok/s at 64k).
+
+**The build matters as much as the kernels.** The same long runs showed prefill at depth 11-16 % *slower* on the
+patched runtime (896 vs 1009 tok/s at 32k, 740 vs 880 at 64k). Cause: the runtime-only oneAPI image has no oneDNN
+headers, so the dev build had `GGML_SYCL_DNN=OFF`, and oneDNN backs the flash-attention prefill path at depth.
+Confirmed with the official build and `GGML_SYCL_FA_ONEDNN=0`: pp512 @ 32k 911 -> 707 tok/s (patched without oneDNN:
+692). Fix: mount the headers and cmake config from `intel-oneapi-dnnl-devel` (190 KB, must match the image's
+libdnnl) into the build container and build with DNN on (`scripts/build-sycl-patched.sh`, `DNNL_DEV=...`): 909 tok/s
+@ 32k, 2273/2273 tests, speed subset 49.2. Always benchmark prefill at depth, not only pp512.
+
+**Draft length and the adaptive policy (patch 0009, `SPEC_ADAPTIVE=1`).** A per-sequence EMA of the accepted
+fraction picking n in 0..n-max by expected tokens per unit step time (verify +0.13/column, draft 0.075, process
+0.035, in single-token units). Speed subset, same kernels: fixed 3 = 47.7 / 46.5 (two runs), fixed 2 = 44.9,
+adaptive capped at 3 = 45.9 (picked 2 and 3 about equally), adaptive capped at 4 = 47.7. No gain over fixed 3 on
+this card and model; the policy stays in the patch as an experiment, off by default.
+
+**Thinking budget vs tasks per minute** (multi-turn repair suite, 16 tasks, pass@1 / pass@3 after up to 2 repairs,
+per-request `reasoning_budget_tokens`, first round, single runs): 512 -> 12 / 14 in 10 min; 768 -> 8 / 12 in 16
+min; 1024 -> 10 / 14 in 17 min; 2048 -> 13 / 14 in 24 min. The non-monotonic 768 shows the single-run variance;
+repeats are running before any recommendation. What is already visible: 512 reaches the 2048 final pass count in
+less than half the wall time.
+
+## 6. Things that did not work (details in 08)
 Four rows per sub-group everywhere (Q6_K and small matrices got slower; the fused GLU kernel spilled), the large
 register file JIT option (helps n=8 by 30 % but not the dominant n=4 shapes; also halves resident threads), and the
 instruction-count hypothesis on its own: pre-decoding alone changed nothing for Q4_K at n=4 because the compiler had
