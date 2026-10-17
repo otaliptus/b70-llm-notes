@@ -1,0 +1,155 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d8afd40..d33745d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1466,6 +1466,38 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // local timing instrumentation (SPEC_TIMING env): where the drafting time goes
++    int64_t tm_proc_us = 0, tm_ddec_us = 0, tm_dsmp_us = 0; int64_t tm_n_proc = 0, tm_n_draft = 0, tm_n_steps = 0;
++    bool tm_on = getenv("SPEC_TIMING") != nullptr;
++
++    // Adaptive draft length (SPEC_ADAPTIVE=1): per sequence, keep an EMA of the accepted fraction and pick the
++    // draft length n in 0..n_max that maximizes expected tokens per unit step time. Costs are in units of a
++    // single-token target step (defaults from Arc Pro B70 measurements, override with SPEC_ADAPTIVE_CV/CD/CP):
++    //   verify: 1 + cv * n (each extra column), draft: cd per MTP pass, process(): cp per step.
++    // n = 0 disables speculation for that step when the model predicts it loses.
++    static float env_f(const char * k, float d) { const char * v = getenv(k); return v ? (float) atof(v) : d; }
++    bool  ad_on    = getenv("SPEC_ADAPTIVE") != nullptr;
++    float ad_cv    = env_f("SPEC_ADAPTIVE_CV", 0.13f);
++    float ad_cd    = env_f("SPEC_ADAPTIVE_CD", 0.075f);
++    float ad_cp    = env_f("SPEC_ADAPTIVE_CP", 0.035f);
++    float ad_alpha = env_f("SPEC_ADAPTIVE_ALPHA", 0.1f);
++    std::vector<float>   ad_p;        // [n_seq] EMA of accepted / drafted
++    std::vector<int32_t> ad_last_n;   // [n_seq] tokens drafted in the last step
++    std::vector<int32_t> ad_n;        // [n_seq] draft length chosen for the current step
++    std::vector<int64_t> ad_hist;     // picks histogram (0..8), for the SPEC_TIMING report
++
++    int ad_pick(llama_seq_id seq_id, int cap) const {
++        const float p = ad_p[seq_id];
++        int best_n = 0; float best = 1.0f / (1.0f + ad_cp);  // n = 0: one token per plain step
++        float e = 1.0f, pk = 1.0f;
++        for (int n = 1; n <= cap; ++n) {
++            pk *= p; e += pk;                                  // expected accepted tokens incl. the target's own
++            const float t = 1.0f + ad_cv * n + ad_cd * n + ad_cp;
++            if (e / t > best) { best = e / t; best_n = n; }
++        }
++        return best_n;
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1534,6 +1566,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+ 
++        ad_p.assign(n_seq, 0.6f);
++
++        ad_last_n.assign(n_seq, 0);
++
++        ad_n.assign(n_seq, 0);
++
++        ad_hist.assign(9, 0);
++
+         i_last.assign(n_seq, -1);
+         i_batch_beg.assign(n_seq, -1);
+         i_batch_end.assign(n_seq, -1);
+@@ -1652,7 +1692,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
++                const int64_t tm0 = ggml_time_us();
+                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++                if (tm_on) { llama_synchronize(ctx_dft); tm_proc_us += ggml_time_us() - tm0; tm_n_proc++; }
+                 if (rc != 0) {
+                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+@@ -1691,6 +1733,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     void draft(common_speculative_draft_params_vec & dparams) override {
++        if (tm_on && ++tm_n_draft % 64 == 0) {
++            fprintf(stderr, "SPEC_TIMING draft calls %lld: process %.1f ms/call (%lld) | draft decode %.2f ms/step (%lld steps, %.2f steps/call) | draft sample %.2f ms/step\n",
++                    (long long) tm_n_draft, tm_n_proc ? tm_proc_us / 1000.0 / tm_n_proc : 0.0, (long long) tm_n_proc,
++                    tm_n_steps ? tm_ddec_us / 1000.0 / tm_n_steps : 0.0, (long long) tm_n_steps, (double) tm_n_steps / tm_n_draft,
++                    tm_n_steps ? tm_dsmp_us / 1000.0 / tm_n_steps : 0.0);
++            if (ad_on) {
++                fprintf(stderr, "SPEC_ADAPTIVE p=%.2f picks n0..n8 = %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", ad_p.empty() ? 0.0 : ad_p[0],
++                        (long long) ad_hist[0], (long long) ad_hist[1], (long long) ad_hist[2], (long long) ad_hist[3], (long long) ad_hist[4],
++                        (long long) ad_hist[5], (long long) ad_hist[6], (long long) ad_hist[7], (long long) ad_hist[8]);
++            }
++        }
+         auto & ctx_dft = params.ctx_dft;
+ 
+         batch.clear();
+@@ -1723,6 +1776,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_reset(smpls[seq_id].get());
+             }
+ 
++            {
++                const int cap = dp.n_max > 0 ? std::min<int>(dp.n_max, params.n_max) : params.n_max;
++                ad_n[seq_id] = ad_on ? ad_pick(seq_id, cap) : cap;
++                if (ad_hist.size() > (size_t) std::max(0, ad_n[seq_id])) { ad_hist[std::min<int>(ad_n[seq_id], 8)]++; }
++                if (ad_n[seq_id] <= 0) {
++                    // predicted to lose: no draft this step, the target decodes one token
++                    ad_last_n[seq_id] = 0;
++                    n_drafting--;
++                    drafting[seq_id] = false;
++                    continue;
++                }
++            }
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -1752,7 +1818,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+             }
+ 
++            const int64_t tm1 = ggml_time_us();
+             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++            if (tm_on) { llama_synchronize(ctx_dft); tm_ddec_us += ggml_time_us() - tm1; tm_n_steps++; }
+             if (ret != 0) {
+                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                 break;
+@@ -1770,7 +1838,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
++                const int64_t tm2 = ggml_time_us();
+                 const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                if (tm_on) { tm_dsmp_us += ggml_time_us() - tm2; }
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
+@@ -1803,7 +1873,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if (ad_n[seq_id] <= (int) result.size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+@@ -1853,6 +1923,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (dp.result->size() < (size_t) params.n_min) {
+                 dp.result->clear();
+             }
++            ad_last_n[seq_id] = (int32_t) dp.result->size();
+         }
+     }
+ 
+@@ -1861,6 +1932,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (ad_on && ad_last_n[seq_id] > 0) {
++            const float r = std::min(1.0f, (float) n_accepted / (float) ad_last_n[seq_id]);
++            ad_p[seq_id] = (1.0f - ad_alpha) * ad_p[seq_id] + ad_alpha * r;
++        }
++
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+             return;
