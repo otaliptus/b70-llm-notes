@@ -166,3 +166,52 @@ SERVE_SYCL_ENV=GGML_SYCL_ENABLE_XMX_ESIMD=0 scripts/serve-orca-sycl.sh
 python tools/ab_engine.py cfg.json new:exe=/path/new/strata old:exe=/path/old/strata --rounds 3
 python tools/ab_engine.py cfg.json kreg:STRATA_MMVQ_KREG=1 base:STRATA_MMVQ_KREG=0 --rounds 3
 ```
+
+## 6. What is left on the table (measured 2026-10-19, not adopted yet)
+
+**Attention at depth is now the dominant cost.** Plain decode sits at 466 GB/s effective over the 15.8 GB of weights
+(peak 608 GB/s), but `llama-bench` tg128 falls from 29.5 at depth 0 to 22.8 at 16k and 18.7 at 32k with q8_0 KV. The
+Gated DeltaNet layers are noise (4.5 us per layer). The flash-attention decode kernel at this model's shape (head size
+256, 4 KV heads, 6 queries per KV head) is what costs it, per `test-backend-ops perf`:
+
+| KV type | kv length | us per call | KV bytes read | effective GB/s |
+|---|---|---|---|---|
+| f16 | 16384 | 420 | 67 MB | 160 |
+| f16 | 65536 | 1636 | 268 MB | 164 |
+| q8_0 (2 KV heads, GQA 12) | 32768 | 702 | 36 MB | 51 |
+| f16 (2 KV heads, GQA 12) | 32768 | 440 | 67 MB | 153 |
+| f16, GQA 1 (reference) | 32768 | 474 | 268 MB | 567 |
+
+q8_0 KV takes 1.6x the time of f16 for half the bytes. Sixteen attention layers at 1.2-1.4 ms each is the whole gap
+between depth 0 and depth 32k. Two things follow:
+
+- **f16 KV instead of q8_0**: tg128 29.6 / 24.7 / 21.4 at 0 / 16k / 32k against 29.5 / 22.8 / 18.7 (+8 % at 16k,
+  +15 % at 32k), prefill unchanged. f16 at a 131k window costs the same VRAM as q8_0 at 262k, so if 131k is enough
+  (the agent compacts at 48k) this is a free change.
+- **PR #30606** routes single-query decode at head size 256 on Battlemage to the FA vector kernel (f16 KV only); its
+  author measured Qwen3.8-27B tg128 at 32k 18.6 to 20.6. Stacks with the above. Not built here yet.
+
+**DFlash2 block drafter.** An official DFlash2 drafter for the base model exists as GGUF (1.1 GB at Q4_K_M) and the
+DFlash2 code is in llama.cpp since August. On the XMX runtime the verify cost is flat to 80 columns, so a 7-token block
+costs what a 3-token one did. The SYCL `out_prod` strided-f32 patch (0001) was applied for safety, though the drafter
+loaded without it. Speed subset, budget 2048, one pass per row, MTP control on the same binary:
+
+| drafter | draft length | median tok/s | accepted per step |
+|---|---|---|---|
+| MTP + n-gram (served) | 3 | 63.2 (earlier 61.5, 61.4, 63.4) | 2.7 |
+| DFlash2 | 5 | 67.5 | 3.0 |
+| DFlash2 | 7 | 66.8, 74.8 | 3.1-3.2 |
+| DFlash2 | 12 | 64.7 | 3.0 |
+| DFlash2 + n-gram | 7 | 64.5 | 3.2 |
+| DFlash2, p-min 0.5 | 7 | 61.4 | 3.4 |
+
+Acceptance is 0.25-0.40 per drafted token, against 5.3 accepted per step the model card reports on the base model: the
+drafter was trained for the base and this is a fine-tune. Per task the gain ranges from flat (the DNS question) to
++25 % (the short table task). The two drafters cannot be combined (`failed to create MTP context`). Verdict: +6-13 % on
+the subset, worth a full-suite alternating pair before switching; a drafter fine-tuned on the target would be the
+bigger win.
+
+**Checked and dropped**: output head Q6_K is 1.0 GB per token (5 % of decode), Q4_K would buy ~2 % for a perplexity
+cost; the Q4_K 5-8 column row pairing PR is superseded by XMX; SYCL graph record/replay is reported negligible on
+Battlemage by its author; prompt-prefix reuse across agent turns already works (15-107 new prompt tokens evaluated per
+turn in a three-turn session), so the server's checkpoint handling is not a cost here.

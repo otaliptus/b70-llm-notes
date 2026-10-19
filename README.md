@@ -33,7 +33,9 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    7.8 / 8.3 vs 10.2 / 10.2 min, pass counts within the run-to-run spread, long suite 21/21 both; op tests and perplexity
    unchanged. Strata 0.1.45 is +2-4 % decode with identical greedy answers; its opt-in KREG kernels another +4 % but the
    answers change. Seven of eleven suggested upstream items did not apply to this model once the GGUF and the served
-   flags were checked. [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md)
+   flags were checked. Next on the list, measured but not adopted: f16 KV (+8-15 % decode at 16-32k depth, the SYCL
+   attention decode kernel at head size 256 runs at 50-160 GB/s) and the official DFlash2 block drafter (+6-13 % on the
+   speed subset). [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
