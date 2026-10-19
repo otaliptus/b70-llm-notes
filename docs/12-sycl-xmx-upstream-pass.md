@@ -215,3 +215,41 @@ bigger win.
 cost; the Q4_K 5-8 column row pairing PR is superseded by XMX; SYCL graph record/replay is reported negligible on
 Battlemage by its author; prompt-prefix reuse across agent turns already works (15-107 new prompt tokens evaluated per
 turn in a three-turn session), so the server's checkpoint handling is not a cost here.
+
+## 7. Adopted the same afternoon: f16 KV, the vector-kernel PR, DFlash2
+
+All three of section 6 went in together, validated as one configuration against the morning's served one.
+
+- Context 131072 with f16 KV instead of 262144 with q8_0 (same ~9 GB of KV).
+- PR #30606 on top of the XMX runtime (plus the strided `out_prod` patch 0001 for the drafter graph). llama-bench
+  tg128 with f16 KV: 30.0 / 26.3 / 23.5 / 18.5 at depth 0 / 16k / 32k / 64k, against 29.5 / 22.8 / 18.7 for the
+  served q8_0 setup (+26 % at 32k). One caveat, stated as measured: `test-backend-ops` shows 11 additional
+  `FLASH_ATTN_EXT` tolerance misses with the PR, all head size 256, 4 KV heads, kv >= 32767, 1-5 queries, NMSE
+  7e-4 to 1.6e-3 against the 5e-4 threshold (2.6-4 % RMS deviation of the attention output at that depth). The two
+  ERR ~1.0 failures are pre-existing on every build (upstream issue #30757). Perplexity at 32768-token chunks is
+  identical to four decimals with and without the PR (2.7678; q8_0 2.7682), but that exercises the batched prefill
+  path, not the single-query kernel; the long-context suite below is the practical check.
+- DFlash2 drafter at draft length 7 instead of MTP + n-gram at 3.
+
+Full 39-task suite, agent budget 512, alternating fast / served / fast / served, each row one pass:
+
+| configuration | median tok/s | wall | passes / 39 | accepted per step | acceptance |
+|---|---|---|---|---|---|
+| fast, pair 1 | 78.1 | 6.9 min | 29 | 3.7 | 0.39 |
+| served, pair 1 | 65.1 | 7.8 min | 30 | 3.1 | 0.60 |
+| fast, pair 2 | 77.1 | 7.2 min | 30 | 3.6 | 0.38 |
+| served, pair 2 | 64.6 | 8.1 min | 32 | 3.1 | 0.60 |
+
++20 % tok/s and 11 % less wall. Passes average 29.5 against 31 with an identical-configuration spread of 2 seen in
+earlier pairs, so a small accuracy cost is possible and not excluded; it will be watched over more runs. Long suite,
+one pass each, 21/21 on both:
+
+| depth | fast decode tok/s | served decode tok/s |
+|---|---|---|
+| 8k | 75.2 | 61.3 |
+| 32k | 66.1 | 48.7 |
+| 64k | 57.7 | 36.3 |
+
+Time to first token is unchanged (prefill is the same code). Over the day, the served Orca went from 49.6 to 78.1
+tok/s median on the full suite at the same budget: XMX kernels (+30 %), then f16 KV, the vector kernel and the
+block drafter (+20 %).
