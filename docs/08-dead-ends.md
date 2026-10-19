@@ -55,7 +55,16 @@ Measured and rejected, with the number that killed each one.
 - The dequant + XMX GEMM path for 9..64 columns: 3x slower per token than MMVQ at 8 (batched-bench B=12 collapses
   to 33 t/s aggregate); keep speculative batches at <= 8 tokens on this backend.
 
+- Newer llama.cpp base alone (master b11721, 2026-10-19): with our kernels ported 46.6 tok/s on the speed subset, without
+  them 41.0: same as b11696. The gain in 12 is the XMX pull request, not the base.
+- Draft length 5 on the XMX runtime: 62.0 vs 61.5 at 3 (speed subset); acceptance falls to 0.40-0.65 and the longer
+  window does not pay even with a flat verify cost. Draft length 4: see 12.
+- Our patch 0008 on top of PR #29864: does not apply and is not needed; the PR's ESIMD path handles n >= 2 and the
+  plain SYCL kernels are no longer on the hot path there.
+
 ## Strata
+- Strata PR #2804 KREG as the default engine (2026-10-19): +4 % decode on IQ3_S Flash-Next/Swift, but greedy answers
+  change (6/12 and 3/12 identical), so the bench baselines would stop being reproducible; kept opt-in.
 - Draft length 3 or 5 instead of 4: within noise (41-50 tok/s on the same prompts).
 - Updating to 0.1.44.1: no engine change for the B70; speed identical.
 

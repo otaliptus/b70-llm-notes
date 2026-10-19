@@ -24,3 +24,6 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   opt out per call with `"experimental_speed_projection": false`, which the bench does for the "stock" rows.
 - **MTP draft length** (`--spec N`): 3, 4 and 5 measured 41-50 tok/s on the same four prompts with the 2048 budget;
   the differences are noise, so the default 4 stays (unlike llama.cpp's DFlash drafter on Bolt, where 3 was clearly best).
+- **Engine updates** (2026-10-19): 0.1.45 is +2-4 % decode on the IQ3_S models with byte-identical greedy answers; the
+  opt-in KREG kernels (PR #2804, `STRATA_MMVQ_KREG=1`) another +4 % with changed answers. A/B method, tables and the
+  two `setup.sh`/build-log gotchas in [12](12-sycl-xmx-upstream-pass.md).

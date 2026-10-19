@@ -4,7 +4,7 @@ Working notes from two weeks of running 20-80B open-weight models on a single In
 llama.cpp (SYCL and Vulkan backends) and Strata, plus the small benchmark harness used to compare them. Everything
 here is generic: no personal paths, keys or hostnames; scripts take their locations from environment variables.
 
-## Five results worth knowing
+## Six results worth knowing
 1. **A hard thinking budget (~2048 tokens) beats unlimited thinking** for every Qwen-family reasoning model tried:
    higher score *and* 2-4x less wall time, because unlimited runs regularly think to the output limit and never
    answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md)
@@ -27,6 +27,13 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    oneDNN or prefill at depth loses 16 %. Thinking budget, three rounds each on a 16-task repair suite: 512 passes
    as many tasks as 2048 (13-14 of 16 after repairs) in 44 % of the wall time, so the agent now runs at 512.
    [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md)
+6. **Upstream caught up and overtook: put the verify step on the XMX units.** llama.cpp PR #29864 runs the multi-column
+   K-quant mat-vecs on int8 DPAS and its cost is flat from 2 to 8 columns (Q4_K 17408x5120, n = 4: 91 us vs 133 with our
+   kernels and 157 on master). Full suite at budget 512, two alternating pairs: 64.6 / 64.9 vs 49.6 / 49.3 tok/s median,
+   7.8 / 8.3 vs 10.2 / 10.2 min, pass counts within the run-to-run spread, long suite 21/21 both; op tests and perplexity
+   unchanged. Strata 0.1.45 is +2-4 % decode with identical greedy answers; its opt-in KREG kernels another +4 % but the
+   answers change. Seven of eleven suggested upstream items did not apply to this model once the GGUF and the served
+   flags were checked. [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
@@ -44,9 +51,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/09-vulkan-kernels.md`](docs/09-vulkan-kernels.md) | llama.cpp Vulkan kernel work: IQ2_XXS int8 dot, dedicated NVFP4 shader, router fix; 42 -> 51 tok/s plain decode |
 | [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md) | llama.cpp SYCL: where a speculative step goes, probabilistic MTP drafting, faster multi-column K-quant mat-vecs, full-suite validation, the oneDNN build trap; 36 -> 48 tok/s served |
 | [`docs/11-agent-context-management.md`](docs/11-agent-context-management.md) | keeping a local agent fast over long sessions: compaction point, durable notes, tool logs on disk, stable prefixes, per-request thinking budgets, what to count |
+| [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md) | upstream pass 2026-10-18/19: llama.cpp PR #29864 XMX multi-column mat-vecs (+30 % full-suite tok/s over part 2, per-kernel table, flat verify cost), Strata 0.1.45 and KREG A/Bs, draft length revisited, and the backlog items that did not apply |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
 | [`scripts/`](scripts/) | serve / build / sweep / profile / requant / perplexity scripts |
-| [`patches/`](patches/) | llama.cpp patches. b11669: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes. b11696: SYCL K-quant multi-column mat-vecs (0008), MTP draft timing (0009), Qwen3.5-class perf shapes (0010) |
+| [`patches/`](patches/) | llama.cpp patches. b11669: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes. b11696: SYCL K-quant multi-column mat-vecs (0008), MTP draft timing (0009), Qwen3.5-class perf shapes (0010). On PR #29864 / master b11721 apply 0009-0010 only (0008 is superseded there, see 12) |
 
 ## Quick start
 ```sh
@@ -60,7 +68,7 @@ python3 bench/report.py                               # bench/results/report.md
 ```
 Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), OrcaSAQ-2-Cyber-27B (Q4_K_S), LiquidAI
 LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541,
-b11669 and b11696. Dates 2026-10-10 to 2026-10-17.
+b11669, b11696 and PR #29864 on b11721; Strata 0.1.44.1 and 0.1.45. Dates 2026-10-10 to 2026-10-19.
 
 ## License
 MIT, see [`LICENSE`](LICENSE).
