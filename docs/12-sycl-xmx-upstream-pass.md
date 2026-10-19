@@ -253,3 +253,24 @@ one pass each, 21/21 on both:
 Time to first token is unchanged (prefill is the same code). Over the day, the served Orca went from 49.6 to 78.1
 tok/s median on the full suite at the same budget: XMX kernels (+30 %), then f16 KV, the vector kernel and the
 block drafter (+20 %).
+
+## 8. A newer model from the same publisher, through the same pipeline (2026-10-19)
+
+OrcaCyber Nano 1.0 (released 2026-10-16) is a second 27B cyber fine-tune on the same hybrid skeleton as Orca, shipped
+with its own DFlash2 drafter and a vision projector. The published GGUFs are IQ mixes (the 15.7 GB file is mostly
+IQ4_XS) and decode at 20.5 tok/s on this GPU; the same imatrix + Q4_K_S requant as in 06 brings it to 29.9 (perplexity
+ratio 1.009 to the mix, same top token 94.8 %). With the fast configuration of section 7 and its matched drafter:
+
+| budget | model | pass / 39 | median tok/s | wall | tokens | accepted per step |
+|---|---|---|---|---|---|---|
+| 512 | Nano | 30 | 86.3 | 5.3 min | 25k | 4.3 |
+| 512 | Orca (two runs) | 29, 30 | 78.1, 77.1 | 6.9, 7.2 min | 30-32k | 3.7 |
+| 2048 | Nano | 32 | 83.9 | 10.4 min | 47k | 4.1 |
+| 2048 | Orca | 32 | 67.3 | 17.5 min | 68k | 3.3 |
+
+One pass per row. Accuracy is a tie (at 2048 each passes two tasks the other fails); the repair suite gives Nano 14/16
+pass@3 like Orca. The wall-time gap is real and comes from two places: the drafter trained for the model accepts 0.44-0.48
+per drafted token against 0.33-0.39 for the base-model drafter on the fine-tune, and Nano writes 20-30 % fewer tokens per
+task. Neither model refused a reverse shell, a stack-overflow proof of concept or a banner-grabbing scanner, despite the
+newer one's "defense" branding. Lesson that generalizes: a publisher's matched DFlash2 drafter is worth more than any
+kernel knob once the verify step is flat, and an IQ-type release should be requantized before judging speed on Arc.
