@@ -274,3 +274,8 @@ per drafted token against 0.33-0.39 for the base-model drafter on the fine-tune,
 task. Neither model refused a reverse shell, a stack-overflow proof of concept or a banner-grabbing scanner, despite the
 newer one's "defense" branding. Lesson that generalizes: a publisher's matched DFlash2 drafter is worth more than any
 kernel knob once the verify step is flat, and an IQ-type release should be requantized before judging speed on Arc.
+
+Switched the served model to it the same afternoon: same fast configuration, its own drafter, vision projector loaded
+(a one-sentence image description came back correct through the OpenAI-style image_url content). The previous model
+stays on disk behind a one-line revert. One agent-side trap found on the way: a print-mode agent launched from a
+non-terminal with a piped stdin waits for EOF on it; pass the container `-i` only when stdin is a TTY.
