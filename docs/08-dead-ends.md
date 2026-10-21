@@ -68,6 +68,10 @@ Measured and rejected, with the number that killed each one.
 - Draft length 3 or 5 instead of 4: within noise (41-50 tok/s on the same prompts).
 - Updating to 0.1.44.1: no engine change for the B70; speed identical.
 
+## Small models as agent replacements
+- Spark-X2.6-4B (2026-10-21): best 24/39 at the template's low effort in 49 min, repair suite 6/16 pass@3; a hard
+  thinking budget breaks its coding, no budget overthinks to the output cap. Numbers in 03. Not a lab candidate.
+
 ## Thinking budgets
 - Unlimited thinking: 6-12 of 39 answers lost to the output limit, 2-4x the wall time.
 - Soft `reasoning_effort: low`: tail of capped answers remains, wall time barely improves.

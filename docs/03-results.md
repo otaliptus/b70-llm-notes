@@ -64,3 +64,29 @@ an `undo`.
 | Bolt, Vulkan + DFlash n=3 | 777 | 50 median over 39 tasks | see 05 |
 | Bolt, Vulkan + DFlash, ssm tensors Q4_0 | 966 | 56 | +13 % perplexity, opt-in |
 | Bolt, patched Vulkan kernels (09) | 789 | 51.0 plain, **64.2 median with DFlash n=3** | 34/39, perplexity unchanged |
+
+## Spark-X2.6-4B (XHToken, released 2026-10-19), measured 2026-10-20/21
+
+A 4B dense on-device agent model (36 layers, sliding window 512 with every fourth layer full, 1M context, no MTP or
+drafter; llama.cpp architecture `spark2_5`). Q8_0 on the SYCL XMX runtime with f16 KV: 5552 tok/s prefill, 102.7 tok/s
+decode fresh, 68.2 at 32k depth (Q4_K_M: 120.6 / 75.7). Sampling per the card (temperature 1.0, top-p 0.95, no top-k),
+n-gram drafting on but accepting only 6-31 %. 39-task suite, one pass per row, 16k output cap:
+
+| thinking setting | pass / 39 | code | compr. | knowl. | wall | completion tokens | hit the cap |
+|---|---|---|---|---|---|---|---|
+| off | 12 | 1/16 | 2/10 | 9/13 | 5.7 min | 32k | 1 |
+| budget 512 | 20 | 3/16 | 5/10 | 12/13 | 17.9 min | 95k | 4 |
+| budget 2048 | 20 | 4/16 | 6/10 | 10/13 | 22.8 min | 120k | 3 |
+| template effort "low", no budget | 24 | 6/16 | 8/10 | 10/13 | 49.4 min | 256k | 9 |
+| effort "high", budget 8192 | 23 | 6/16 | 7/10 | 10/13 | 44.4 min | 233k | 2 |
+| effort "high", unlimited | 15 | 1/16 | 6/10 | 8/13 | 73.8 min | 378k | 18 |
+
+Same tasks and budget 2048 for scale: LFM2.5-24B-A2B 28 in 15 min, the two 27B cyber models 32 in 10-18 min. Repair
+suite at budget 512: pass@1 4/16, pass@3 6/16 in 30 min (the 27Bs: 12-14/16 pass@3 in 5-12 min). Long-context suite:
+7/7 at 8k and 32k, 6/7 at 64k, decoding at 61 and 48 tok/s.
+
+Reading: the thinking behaviour is bimodal. A hard budget cuts nearly every coding task mid-thought (2,050-2,080 thinking
+tokens at a 2,048 budget, then wrong code); no budget runs 18 of 39 tasks into the 16k output cap with a median of 13.8k
+thinking tokens. The template's own "low" effort is the best compromise and still costs 3-5x the wall time of a 27B for
+eight fewer passes. Raw decode speed is fine; tokens per task are 3-8x those of the 27Bs. The card's "matches 9B models"
+claim does not reproduce on these tasks, and the 24B-A2B MoE beats it at every setting at similar speed.
