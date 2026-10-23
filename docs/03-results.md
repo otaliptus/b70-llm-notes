@@ -1,13 +1,14 @@
 # Results
 
 All at the 39-task single-turn suite unless noted. Full per-task grids, conversation, repair and long-context tables:
-[`bench/results/report.md`](../bench/results/report.md). Dates: 2026-10-14 to 2026-10-16.
+[`bench/results/report.md`](../bench/results/report.md). Dates: 2026-10-14 to 2026-10-16 unless a section says otherwise.
 
 ## Models and how they were served
 
 | short name | model | file | engine on the B70 | decode tok/s |
 |---|---|---|---|---|
 | Flash-Next | Qwen3.8-Flash-Next (MoE) | IQ3_S | Strata 0.1.44, SYCL engine, 262k ctx | 44-47 |
+| ThinkingCap | bottlecapai ThinkingCap-Qwen3.8-Flash-Next (Flash-Next fine-tune, section at the end) | IQ4_XS (vendor GGUF, MTP block rewritten out, see 07) | Strata 0.1.45, SYCL engine, 131k ctx | 35 |
 | Swift 1.5 | Swift 1.5 (MoE) | IQ3_S | Strata 0.1.44, SYCL engine | 45-47 |
 | Orca 27B | OrcaSAQ-2-Cyber-27B (orcarouter), dense Qwen3-based | Q4_K_S (imatrix requant) | llama.cpp b11541 SYCL, MTP + n-gram drafting | 37 |
 | LFM2.5 | LiquidAI LFM2.5-24B-A2B | Q6_K | llama.cpp b11541 SYCL, n-gram drafting | 128 |
@@ -25,6 +26,9 @@ All at the 39-task single-turn suite unless noted. Full per-task grids, conversa
 | LFM2.5 | 24 | **28** | 27 | 29 (2 cap) | 17 | – | – |
 
 Wall time at b2048: Swift 22 min, Flash-Next 24, Orca 34, Bolt 42 (SYCL) / 25 (Vulkan+DFlash), LFM2.5 15.
+The unlimited column is a Strata 0.1.44 / llama.cpp result. Strata 0.1.45 closes a no-budget thinking block at
+three quarters of `max_tokens` (12k with this suite's cap); re-run that way Flash-Next scores 37 with no cap hits at
+three times the wall of b2048. See the note at the end of the ThinkingCap section below.
 
 ## Multi-turn, repair, long context (budget 2048)
 
@@ -90,3 +94,55 @@ tokens at a 2,048 budget, then wrong code); no budget runs 18 of 39 tasks into t
 thinking tokens. The template's own "low" effort is the best compromise and still costs 3-5x the wall time of a 27B for
 eight fewer passes. Raw decode speed is fine; tokens per task are 3-8x those of the 27Bs. The card's "matches 9B models"
 claim does not reproduce on these tasks, and the 24B-A2B MoE beats it at every setting at similar speed.
+
+<a id="thinkingcap"></a>
+## ThinkingCap-Qwen3.8-Flash-Next (bottlecapai), measured 2026-10-23
+
+A fine-tune of Qwen3.8-Flash-Next trained to think less (vendor card: ~40 % fewer reasoning tokens at the same
+scores, MTP head unchanged). Run from the vendor's IQ4_XS GGUF (88 GiB after the MTP-block rewrite described in
+[07](07-strata-notes.md)) on Strata 0.1.45 with the base model's MTP runtime as the drafter and otherwise the base
+flags (expert streaming, int8 KV, `--spec 4`). The base Flash-Next IQ3_S (78 GiB) was re-run the same evening on the
+same binary as the control, because the 2026-10-14 base numbers above were taken on 0.1.44 and the two releases
+treat a no-budget request differently (note at the end). Sampling 1.0 / 0.95 / 20 as on the card, 16k output cap,
+one run per row.
+
+| run | pass / 39 | code | compr. | knowl. | median tok/s | wall | completion tokens | median thinking / task | hit the cap |
+|---|---|---|---|---|---|---|---|---|---|
+| ThinkingCap, budget 2048 | 34 | 12/16 | 9/10 | 13/13 | 35.5 | 24.6 min | 50k | 0.9k | 0 |
+| base, budget 2048, same evening | 36 | 13/16 | 10/10 | 13/13 | 46.2 | 23.2 min | 62k | 1.6k | 0 |
+| base, budget 2048, 2026-10-14 (0.1.44; two runs) | 34, 34 | 12/16 | 9-10/10 | 12-13/13 | 44 | 24 min | 61k | 1.4k | 0 |
+| ThinkingCap, no budget | 35 | 13/16 | 9/10 | 13/13 | 35.2 | 65.6 min | 128k | 0.9k | 0 |
+| base, no budget, same evening | 37 | 14/16 | 10/10 | 13/13 | 45.4 | 72.0 min | 183k | 1.5k | 0 |
+| base, no budget, 2026-10-14 (0.1.44) | 29 | 7/16 | 10/10 | 12/13 | 42.5 | 84.4 min | 204k | 1.6k | 8 |
+
+Repair suite at budget 2048 (16 coding tasks, up to two repairs each): ThinkingCap pass@1 12/16, pass@3 14/16,
+7 repairs, 31 min; the base the same evening 13/16, 15/16, 4 repairs, 21 min. ThinkingCap's two unrepaired tasks are
+the JSON parser and the regex engine; the base misses only the regex engine.
+
+Per task the differences sit at the noise floor (2-4 tasks between two runs of one model): at budget 2048 the two
+models differ on 2 tasks, both base passes (a diff viewer and the JSON parser); with no budget on 4 (ThinkingCap
+loses an expression evaluator, a spec question and a cron parser, and wins the JSON parser).
+
+Reading:
+- The vendor's token claim reproduces. ThinkingCap's median thinking per task is 0.9k against 1.5-1.6k for the
+  base, the tail is shorter (5 tasks reach the 12k close against 10; the code tasks' median thinking with no budget
+  is 4.1k against 10.1k), and total completion tokens are 19 % lower at budget 2048 and 30 % lower with no budget.
+- The score does not move: 34 vs 36 and 35 vs 37 against the same-evening base, 14 vs 15 of 16 on repair. All
+  inside the noise floor of a single run, so the honest reading is "no better than the base", not "worse".
+- The token savings do not become wall time on this GPU because the IQ4_XS file decodes 23 % slower than the
+  IQ3_S base (35 vs 46 tok/s median): with 32 GB of VRAM the expert cache holds 10,110 experts instead of 12,478,
+  and 15,477 experts (35 GiB) instead of 13,298 (25 GiB) sit in pinned host memory and are read over PCIe. That is
+  the quant, not the fine-tune; a like-for-like speed comparison needs the same quant on both sides. Wall per passed
+  task: 0.72 vs 0.65 min at budget 2048, 1.87 vs 1.95 min with no budget.
+- A hard budget of 2048 still removes most of the thinking tail at no measurable cost for both models (ThinkingCap
+  34 in 25 min vs 35 in 66 min).
+
+**Note on "no budget" and Strata 0.1.45.** The same-evening base control scored 37 with no cap hits where the
+2026-10-14 run scored 29 with 8 (9 in the headline table, which also counted a task that stopped at 15k). Strata
+0.1.45 (commit d0e990ba, "max_tokens counts the thinking") closes a no-budget thinking block at three quarters of
+`max_tokens` so a quarter is left for the answer; the config key `answer_room: false` opts out. With this suite's
+16k cap that is a 12k close: 10 of the control's 39 tasks and 5 of ThinkingCap's stop at 11.8-12.1k thinking tokens
+and then answer, which is where the 8 lost answers of 10-14 went. So on 0.1.45 "unlimited" is a 12k soft budget plus
+a forced answer, and for Flash-Next it scores the same as budget 2048 (37 vs 36, one run each) at three times the
+wall. The wall-time half of the budget finding stands; the score half is specific to engines that let the thinking
+run into the output cap (llama.cpp without `--reasoning-budget`, Strata before 0.1.45 or with `answer_room: false`).

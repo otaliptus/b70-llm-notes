@@ -35,3 +35,13 @@ the budget size and unlimited is marginally best, at twice the wall time.
 ## How to apply
 Set a ~2048 budget as the default in every reasoning-model config and let the client raise it per request when a
 task deserves it. On the model side, make sure the budget message is set so the model answers instead of stopping.
+
+## Update 2026-10-23: engines that force an answer
+Strata 0.1.45 (commit d0e990ba, "max_tokens counts the thinking") closes a no-budget thinking block at three
+quarters of `max_tokens` so the answer keeps a quarter; the config key `answer_room: false` restores the old
+behaviour. Re-run on it with this suite's 16k cap, Flash-Next IQ3_S with no budget scores 37 (10 of 39 tasks stop
+thinking at 11.8-12.1k tokens and answer, none hit the cap, 72 min) against 36 at budget 2048 (23 min), one run
+each, noise floor 2-4. So the score half of the finding above is specific to engines that let the thinking run into
+the output cap (llama.cpp without `--reasoning-budget`, Strata before 0.1.45); the wall-time half stands, and
+budget 2048 stays the default here. Details, and the ThinkingCap fine-tune measured the same evening:
+[03](03-results.md#thinkingcap).

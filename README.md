@@ -7,7 +7,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 ## Six results worth knowing
 1. **A hard thinking budget (~2048 tokens) beats unlimited thinking** for every Qwen-family reasoning model tried:
    higher score *and* 2-4x less wall time, because unlimited runs regularly think to the output limit and never
-   answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md)
+   answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md). Measured on Strata 0.1.44 and llama.cpp;
+   Strata 0.1.45 closes a no-budget thinking block at three quarters of `max_tokens`, which removes the lost
+   answers but not the wall time (Flash-Next: 37 with no budget vs 36 at b2048, one run each, 72 vs 23 min;
+   [`docs/03-results.md`](docs/03-results.md#thinkingcap)).
 2. **The faster backend depends on the model.** For Orca 27B (dense) Q4_K_S, SYCL gives 2.4x the prefill and +10-30 %
    decode over Vulkan. For Nemotron 3.5 Bolt (hybrid Mamba-2 + MoE, IQ2_XXS + NVFP4) Vulkan gives +45 % decode and
    the DFlash drafter at draft length 3 another +20 %: 29 -> 50 tok/s, same score, 1.7x less wall time.

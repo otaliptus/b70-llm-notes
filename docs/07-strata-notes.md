@@ -27,3 +27,21 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
 - **Engine updates** (2026-10-19): 0.1.45 is +2-4 % decode on the IQ3_S models with byte-identical greedy answers; the
   opt-in KREG kernels (PR #2804, `STRATA_MMVQ_KREG=1`) another +4 % with changed answers. A/B method, tables and the
   two `setup.sh`/build-log gotchas in [12](12-sycl-xmx-upstream-pass.md).
+- **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
+  `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
+  `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next
+  GGUF looked like this) does not load on 0.1.45 as shipped, in three steps: `tools/iq_pack.py` writes a 49th row into
+  `native_experts.txt` which the engine refuses as "a malformed line"; with that fixed, `read_geometry` checks all 49
+  `compress_ratios` entries against the 48-layer interval rule ("compress_ratios[48] = 4 ... makes layer 48 linear
+  attention"); with the header trimmed, the native-dense loader's layer filter has no upper bound and refuses
+  "tensor absent from canonical table: blk.48.ffn_gate_shexp.weight". The engine does model an in-file MTP block
+  (`n_mtp_layers`, subtracted in `family_layout.hpp`); these three places just do not use it. What worked without
+  rebuilding the engine: [`patches/0011`](../patches/0011-strata-iq-pack-skip-in-file-mtp-head-block.patch) for the
+  packer (layers = `block_count - nextn_predict_layers`; the head's block is left out of the expert table and the
+  dense index; the packer's 24 unit tests pass) and
+  [`scripts/gguf-strip-mtp-block.py`](../scripts/gguf-strip-mtp-block.py), which rewrites the eight shards as the
+  48-layer trunk (headers fixed, `split.tensors.count` 1256 -> 1224, the 32 head tensors dropped, every kept tensor
+  sha256-verified, 5 minutes for 90 GiB on an NVMe). Pack the rewritten set with `iq_pack.py --compat-bf16` as in the
+  project's compatibility notes (IQ4_XS experts are served natively; 363 small projections rounded to BF16, max error
+  0.014; under half a minute) and serve it with the base model's `--mtp` runtime, which the vendor card says is the unchanged base
+  head. Results in [03](03-results.md#thinkingcap). Not reported upstream yet.
