@@ -27,6 +27,25 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
 - **Engine updates** (2026-10-19): 0.1.45 is +2-4 % decode on the IQ3_S models with byte-identical greedy answers; the
   opt-in KREG kernels (PR #2804, `STRATA_MMVQ_KREG=1`) another +4 % with changed answers. A/B method, tables and the
   two `setup.sh`/build-log gotchas in [12](12-sycl-xmx-upstream-pass.md).
+- **Engine update to 0.2.6 / engine 0.1.51** (2026-10-26; 14 tags after 0.1.45: the 0.2.x number is the app and the
+  Terminal, the Qwen engine inside is 0.1.50-0.1.51). Build and setup went as before: a fresh AOT build in the unchanged
+  image (25 minutes), then `setup.sh --backend sycl --update --vision no --yes`; setup's closing warning that the engine
+  "is still 0.1.12" is it reading the version out of the SYCL shell wrapper named as the config's exe, cosmetic. Same A/B
+  method as for 0.1.45 (`tools/ab_engine.py`, greedy, alternating fresh engines; 3 rounds per IQ3_S model at a
+  6,345-token prompt, then two 4-arm runs on Flash-Next at 6,345 and 21,102 tokens): decode unchanged on both models
+  (51.4 vs 51.5 tok/s on short chats, 46-50 after the long prompts). The new Battlemage default for prompt reading
+  (fused int8 expert products, `STRATA_PREFILL_MMQ` unset = auto) read the 6,345-token prompt 15 % slower here (1,112 vs
+  1,313 tok/s) and its greedy answer on that prompt differed and varied between restarts: auto times the int8 and FP16
+  chains at every start, and the cache file it writes lands in the container's home, gone with `--rm`
+  (`STRATA_CACHE_DIR` on the mounted folder would keep it). `STRATA_PREFILL_MMQ=off` is the FP16 chain and matched
+  0.1.45 exactly: the same answers on all 8 prompts, 1,316 vs 1,313 tok/s at 6.3k and 1,400 vs 1,396 at 21k. `=1`
+  forces int8: +4.5 % at 6.3k, +2.5 % at 21k, deterministic, long-prompt answers differ (the project's own numbers:
+  KL 0.0002 nats, top-1 99.7 %); `--prefill 8192` on top was slower here (1,145-1,322 at 21k, decode after it 3-7 %
+  down). Two gotchas: the launcher `strata-sycl.sh` drops every `STRATA_*` variable whose value is `0`, so the
+  documented `=0` never reaches the engine (a non-digit value such as `off` is parsed as 0 and gets through); and the
+  server appends to a reused engine log, so a grep over the file also shows the previous session's lines. The configs
+  here carry `"env": {"STRATA_PREFILL_MMQ": "off"}`: parity with 0.1.45 by default, int8 as an opt-in, the same call
+  as for the KREG kernels. Not reported upstream yet.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next
