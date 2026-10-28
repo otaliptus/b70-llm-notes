@@ -79,4 +79,6 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   sha256-verified, 5 minutes for 90 GiB on an NVMe). Pack the rewritten set with `iq_pack.py --compat-bf16` as in the
   project's compatibility notes (IQ4_XS experts are served natively; 363 small projections rounded to BF16, max error
   0.014; under half a minute) and serve it with the base model's `--mtp` runtime, which the vendor card says is the unchanged base
-  head. Results in [03](03-results.md#thinkingcap). Not reported upstream yet.
+  head. Results in [03](03-results.md#thinkingcap). Reported upstream on 2026-10-28 as a comment on Strata #4449 (a
+  CUDA report of the same file shape, filed that morning), with the SYCL run of this file, the third stop and the code
+  locations; #3890 asks for this file.
