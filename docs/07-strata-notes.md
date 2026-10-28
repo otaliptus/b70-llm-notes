@@ -45,7 +45,9 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   documented `=0` never reaches the engine (a non-digit value such as `off` is parsed as 0 and gets through); and the
   server appends to a reused engine log, so a grep over the file also shows the previous session's lines. The configs
   here carry `"env": {"STRATA_PREFILL_MMQ": "off"}`: parity with 0.1.45 by default, int8 as an opt-in, the same call
-  as for the KREG kernels. Not reported upstream yet.
+  as for the KREG kernels. Reported upstream on 2026-10-28: the launcher dropping `=0` is Strata #4546, the auto
+  default's speed and per-start crossover on the B70 is #4547, setup's version check is #4544, and the A/B tool's log
+  reuse is #4545.
 - **Engine update to 0.2.7.1 / engine 0.1.53** (2026-10-28; two tags after 0.2.6, a DGX Spark / Mac DeepSeek /
   NVIDIA-and-Radeon-defaults release whose notes say Metal and SYCL got no speed change). Incremental build in the same
   image (4 minutes), the same setup line, no config change needed. The 0.2.7 speed defaults (residency-biased routing
