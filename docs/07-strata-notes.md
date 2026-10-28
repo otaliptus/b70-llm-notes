@@ -46,6 +46,20 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   server appends to a reused engine log, so a grep over the file also shows the previous session's lines. The configs
   here carry `"env": {"STRATA_PREFILL_MMQ": "off"}`: parity with 0.1.45 by default, int8 as an opt-in, the same call
   as for the KREG kernels. Not reported upstream yet.
+- **Engine update to 0.2.7.1 / engine 0.1.53** (2026-10-28; two tags after 0.2.6, a DGX Spark / Mac DeepSeek /
+  NVIDIA-and-Radeon-defaults release whose notes say Metal and SYCL got no speed change). Incremental build in the same
+  image (4 minutes), the same setup line, no config change needed. The 0.2.7 speed defaults (residency-biased routing
+  for cards of 13 GiB or less, int8 prompt attention, the AMD tables, master switch `STRATA_DEFAULTS=026`) sit in code
+  the SYCL engine does not compile, so nothing switched on here; what did reach the B70 binary are fixes (the per-layer
+  table reader no longer hangs after a failed read, conversation parking never reuses another chat's K/V, a checkpoint
+  copy that runs out of memory no longer ends the engine, `build.sh` exits with the build's status). Same A/B as for
+  0.2.6 (greedy, 256 new tokens, alternating fresh engines, 3 rounds per IQ3_S model with a 6,345-token prompt, 2 rounds
+  with a 21,102-token prompt): decode 51.4 vs 51.4 tok/s on chats and 46.7-49.2 after the long prompts on both builds,
+  prompt reading 1,311 vs 1,310 and 1,401 vs 1,399 tok/s, all 32 greedy answers identical in prefix and length; the
+  in-file-MTP-head model described further down loads and gives the same greedy answer. No regression
+  detected. New in the serving script and worth knowing: a saved-tuning overlay is applied at every start
+  (nothing applies without a preset store; `STRATA_NO_PRESET=1` skips it), and an args element written as one string
+  `"--flag value"` is now split and announced at startup.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next
