@@ -1,0 +1,46 @@
+diff --git a/strata_control/drafting.py b/strata_control/drafting.py
+index 56aa2c9c..29e6338c 100644
+--- a/strata_control/drafting.py
++++ b/strata_control/drafting.py
+@@ -541,6 +541,16 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
+     return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
+ 
+ 
++def _host_path(value: str) -> Path:
++    """A path the engine's arguments name, as this computer sees it.  The Intel engine runs in a container whose /work is the data root
++    the launcher mounts there (sycl/serve/strata-sycl.sh: STRATA_SYCL_ROOT, else the folder above the repo), and setup_intel writes the
++    arguments with those paths; a /work/... argument that is not here is looked up under that root (local patch, see the lab notes)."""
++    p = Path(value)
++    if not p.exists() and (value == "/work" or value.startswith("/work/")):
++        root = os.environ.get("STRATA_SYCL_ROOT") or str(Path(__file__).resolve().parents[1].parent)
++        return Path(root + value[len("/work"):])
++    return p
++
+ def mtp_ready(args: list[Any]) -> bool | None:
+     """Is the MTP layer this start would load on this computer? ``--mtp <folder>`` with its ``experts.bin`` (or, on a Mac, ``mtp-q2_0.gguf`` beside the folder).
+     None (not known, taken as there) when the arguments name no layer at all (an Intel route, or a layer switched off) or a draft depth instead of a folder (Qwen3.6's
+@@ -551,7 +561,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
+     value = _flag_value(args, "--mtp")
+     if value is None or value.isdigit():
+         return None
+-    folder = Path(value)
++    folder = _host_path(value)
+     try:
+         return (folder / "experts.bin").is_file() or (folder.parent / "mtp-q2_0.gguf").is_file()
+     except OSError:
+@@ -634,11 +644,11 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
+     """The draft vocabulary DFlash2 reads its draft head from: the person's own ``--mtp-draft-vocab``, else the one in the model's MTP folder (the subset the
+     person chose in setup), else the copy the DFlash2 install keeps, else the default subset Strata ships. None when none of them is on this computer."""
+     given = _flag_value(args, "--mtp-draft-vocab")
+-    if given and Path(given).is_file():
+-        return Path(given)
++    if given and _host_path(given).is_file():
++        return _host_path(given)
+     folder = _flag_value(args, "--mtp")
+-    if folder and not folder.isdigit() and (Path(folder) / VOCAB_NAME).is_file():
+-        return Path(folder) / VOCAB_NAME
++    if folder and not folder.isdigit() and (_host_path(folder) / VOCAB_NAME).is_file():
++        return _host_path(folder) / VOCAB_NAME
+     if data_dir and vocab_target(data_dir).is_file():
+         return vocab_target(data_dir)
+     shipped = shipped_vocab()

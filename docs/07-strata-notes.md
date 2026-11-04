@@ -62,6 +62,30 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   detected. New in the serving script and worth knowing: a saved-tuning overlay is applied at every start
   (nothing applies without a preset store; `STRATA_NO_PRESET=1` skips it), and an args element written as one string
   `"--flag value"` is now split and announced at startup.
+- **Engine update to 0.2.10 / engine 0.1.56** (2026-11-04; tags 0.2.8, 0.2.9 and 0.2.10 since 0.2.7.1, 947 commits). The
+  release notes for Arc: int8 DPAS prompt attention on by default for Battlemage (0.2.9, `STRATA_PROMPT_ATTN_ESIMD`),
+  the PR #4185 Battlemage decode kernels (0.2.10; CMake `STRATA_SYCL_IQ_DECODE_FAST=ON` plus six runtime controls on by
+  default), `STRATA_SELECT_GEMM` on by default, and DFlash2 as the default drafter on SYCL. Same build recipe (incremental,
+  under five minutes), same setup line, configs left alone by setup. **Two 0.2.10 bugs hit the Intel route** and need
+  local patches until they are fixed upstream: [`patches/0012`](../patches/0012-strata-drafting-intel-container-paths.patch),
+  because the new per-start drafter choice in `strata_control/drafting.py` tests `--mtp <dir>/experts.bin` on the host while
+  Intel configs name the container's `/work` paths (the layer looks absent, `--mtp` and `--spec-min-p` are stripped, and the
+  model runs with no drafter at all: chat decode 37-39 tok/s instead of 51-58; `"drafting": "mtp"` in the config does not
+  help on its own), and [`patches/0013`](../patches/0013-strata-server-intel-engine-args-kwargs.patch), because the Intel
+  server's two-card hook wraps `engine_args(cfg)` and the server now calls it with `announce=False`, so `server_intel.py`
+  dies at start with a TypeError. With both patches, `"drafting": "mtp"` pinned in every config, the MTP layer loaded and
+  the FP16 prompt path from the previous bullet, the A/B against the 0.2.7.1 engine (greedy, 256 new tokens, three
+  alternating rounds, fresh engine per arm): Flash-Next IQ3_S chat decode 50.5 to 52.9 tok/s, decode after a 6,345-token
+  prompt 45.6 to 48.6, prompt reading 1364 to 1615 tok/s at 6.3k and 1418 to 1760 at 21k; chat answers identical, the
+  long answer keeps its prefix but ends two tokens earlier. Swift IQ3_S: chat decode 50.5 to 50.1, prompt 1392 to 1659,
+  and a **different greedy long answer** (180 to 151 tokens). Attribution runs: `STRATA_SELECT_GEMM=off` changes nothing;
+  `STRATA_PROMPT_ATTN_ESIMD=off` gives back 7 percent of the prompt speed and yields a third long answer; with every
+  switchable new default off the long answers still differ from 0.2.7.1, so the remaining change sits in the compile-time
+  kernels or elsewhere. Each build is deterministic across its own rounds. The six #4185 controls are worth about 2.5 to 3
+  percent of chat decode here. Launcher gotcha, wider than before: those six controls are read as `value[0] != '0'`, so the
+  `off` workaround from the previous bullet turns them *on*; `00` is the one value that passes the launcher and still reads
+  as off. The in-file-MTP-head model still loads through the patched Intel server and gives the same greedy answer at
+  29.9 tok/s.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next

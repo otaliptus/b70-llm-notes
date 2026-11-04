@@ -1,0 +1,15 @@
+diff --git a/sycl/serve/server_intel.py b/sycl/serve/server_intel.py
+index 66bbe1a6..f61208f2 100644
+--- a/sycl/serve/server_intel.py
++++ b/sycl/serve/server_intel.py
+@@ -331,8 +331,8 @@ def install_two_card_spec():
+     from strata_control import intel_spec
+     original = S.engine_args
+ 
+-    def engine_args(cfg):
+-        args = original(cfg)
++    def engine_args(cfg, *more, **kw):               # serve/server.py calls engine_args(cfg, exe, announce=...) since 0.2.10
++        args = original(cfg, *more, **kw)
+         try:
+             if cfg.get("backend") == "sycl" and S.layer_split_of(cfg):
+                 sysfs = intel_spec.sysfs_cards()
