@@ -80,8 +80,8 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   long answer keeps its prefix but ends two tokens earlier. Swift IQ3_S: chat decode 50.5 to 50.1, prompt 1392 to 1659,
   and a **different greedy long answer** (180 to 151 tokens). Attribution runs: `STRATA_SELECT_GEMM=off` changes nothing;
   `STRATA_PROMPT_ATTN_ESIMD=off` gives back 7 percent of the prompt speed and yields a third long answer; with every
-  switchable new default off the long answers still differ from 0.2.7.1, so the remaining change sits in the compile-time
-  kernels or elsewhere. Each build is deterministic across its own rounds. The six #4185 controls are worth about 2.5 to 3
+  switchable new default off the long answers still differ from 0.2.7.1, and so do they with a build that has the #4185 packed
+  arithmetic compiled out as well, so the change sits elsewhere in the 947 commits and the attribution stopped there. Each build is deterministic across its own rounds. The six #4185 controls are worth about 2.5 to 3
   percent of chat decode here. Launcher gotcha, wider than before: those six controls are read as `value[0] != '0'`, so the
   `off` workaround from the previous bullet turns them *on*; `00` is the one value that passes the launcher and still reads
   as off. The in-file-MTP-head model still loads through the patched Intel server and gives the same greedy answer at
