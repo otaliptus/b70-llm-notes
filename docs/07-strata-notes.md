@@ -102,7 +102,7 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   21k 47.5 -> 48.0; prompt reading unchanged; all 20 answer pairs identical; the drafter takes 807 MiB and leaves 37 more expert
   slots than the MTP layer. The `--spec 6 --draft-conf 0.6` are what Strata picks for SYCL. The launcher drops a value of
   exactly `0` (#4546), so testing the switch needed a one-line launcher allowance (patch 0016); patch 0017 gives the A/B tool a
-  per-arm `drafting=` key.
+  per-arm `drafting=` key. Filed upstream as #5286 (with the fix), plus confirming comments on #5138 and #4546.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next
