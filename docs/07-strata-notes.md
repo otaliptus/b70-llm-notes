@@ -86,6 +86,23 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   `off` workaround from the previous bullet turns them *on*; `00` is the one value that passes the launcher and still reads
   as off. The in-file-MTP-head model still loads through the patched Intel server and gives the same greedy answer at
   29.9 tok/s.
+- **DFlash2 vs MTP on Flash-Next, and a SYCL DFlash2 bug** (2026-11-05, v0.2.10 / engine 0.1.56, Arc Pro B70). 0.2.10 makes the
+  DFlash2 block drafter (incoai/Qwen3.8-Flash-Next-DFlash2, Q4_0 pack from `strata drafting fetch`, 0.52 GB) the default on SYCL,
+  but a stock Intel install never starts it: the drafter check reads the launcher *script* instead of the engine binary and the
+  `/work` container paths are checked on the host (both also in upstream #5138; patches 0012 and 0015 here). Once it starts,
+  with a model whose output head is Q6_K (the IQ3_S GGUFs) the engine accepted **0 of every draft** (0 of 1267, 0 of 1275 ...)
+  and decode fell to 11-12 tok/s while the answers stayed the greedy ones. KV type, control vector, prompt-attention kernel and the
+  packed decode arithmetic were all ruled out one at a time. The cause is in `sycl/src/core/dflash2.cpp`: the SYCL engine stores a
+  Q6_K output head as 16-byte-aligned planes (`STRATA_Q6_PLANAR`, default on) and the DFlash2 port gathers its 106,299-row draft
+  head out of that buffer as if it were GGUF rows, so the head is garbage. The MTP drafter on the same path already gathers from
+  the planes. `STRATA_Q6_PLANAR=0` proved it (66-83 % accepted at once); patch 0014 does the planar gather in the DFlash2 code.
+  Q8_0-head models are not affected, which is why the Unsloth UD-Q4_K_XL in #5138 worked. With the fix, 3 rounds of chat + 6.3k
+  prompt and 2 rounds of a 21k prompt, greedy, 256 new tokens, alternating fresh engines, medians, MTP -> DFlash2: code chat
+  59.0 -> 68.5 tok/s (acceptance 81 -> 87 %), two prose chats 52.8 -> 54.8 and 51.5 -> 52.7, decode after 6.3k 48.6 -> 49.2, after
+  21k 47.5 -> 48.0; prompt reading unchanged; all 20 answer pairs identical; the drafter takes 807 MiB and leaves 37 more expert
+  slots than the MTP layer. The `--spec 6 --draft-conf 0.6` are what Strata picks for SYCL. The launcher drops a value of
+  exactly `0` (#4546), so testing the switch needed a one-line launcher allowance (patch 0016); patch 0017 gives the A/B tool a
+  per-arm `drafting=` key.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next

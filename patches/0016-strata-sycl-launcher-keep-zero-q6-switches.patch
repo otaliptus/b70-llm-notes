@@ -1,0 +1,17 @@
+diff --git a/sycl/serve/strata-sycl.sh b/sycl/serve/strata-sycl.sh
+index fcf31f0b..5a2f35b4 100755
+--- a/sycl/serve/strata-sycl.sh
++++ b/sycl/serve/strata-sycl.sh
+@@ -39,7 +39,11 @@ done < <(compgen -e)
+ envs=()
+ for k in "${!setting[@]}"; do
+     # the engine tests the switches by presence: a value of 0 (or empty) means "not set", so it is not passed on
+-    case "${setting[$k]}" in 0|"") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
++    case "${setting[$k]}" in
++        "") ;;
++        0) case "$k" in STRATA_Q6_PLANAR|STRATA_Q6_PACKED) envs+=(-e "$k=0") ;; esac ;;   # local patch: these two read their value, 0 = off
++        *) envs+=(-e "$k=${setting[$k]}") ;;
++    esac
+ done
+ shm=()
+ if [ "${STRATA_SYCL_SHM:-1}" != 0 ] && [ -d /dev/shm ]; then shm=(-v /dev/shm:/dev/shm); fi

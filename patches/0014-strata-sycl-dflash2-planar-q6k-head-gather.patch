@@ -1,0 +1,25 @@
+diff --git a/sycl/src/core/dflash2.cpp b/sycl/src/core/dflash2.cpp
+index 0ab23a15..79b51891 100644
+--- a/sycl/src/core/dflash2.cpp
++++ b/sycl/src/core/dflash2.cpp
+@@ -300,7 +300,19 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
+             return false;
+         }
+         cs_->memcpy(dv, vocab.data(), vocab.size() * 4).wait();
+-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, cs_);
++        bool planar_gathered = false;
++        if (head->type() == 14 && kernels::native_q6_k_is_planar(hw)) {
++            // STRATA_Q6_PLANAR (local patch, see the lab notes): the output head is stored as 16-byte-aligned planes (native_head.cpp), so its
++            // rows cannot be gathered as GGUF rows; the subset is gathered from the planes, planar, as the MTP draft head is (mtp.cpp).
++            // Gathered as rows, the draft head is garbage and the engine accepts 0 of every draft (Arc Pro B70, IQ3_S pack, Q6_K head).
++            void* pd = kernels::native_q6_k_planar_gather(hw, (int) (row_bytes / 210) * 256, dv, (int64_t) vocab.size(), "DFlash2 draft head");
++            if (pd != nullptr) {
++                sycl::free(dhead_, *cs_);
++                dhead_ = (uint8_t*) pd;
++                planar_gathered = true;
++            }
++        }
++        if (!planar_gathered) kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, cs_);
+         cs_->wait();
+         sycl::free(dv, *cs_);
+         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);

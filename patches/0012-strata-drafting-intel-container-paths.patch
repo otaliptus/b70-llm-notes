@@ -1,8 +1,16 @@
 diff --git a/strata_control/drafting.py b/strata_control/drafting.py
-index 56aa2c9c..29e6338c 100644
+index 56aa2c9c..39096388 100644
 --- a/strata_control/drafting.py
 +++ b/strata_control/drafting.py
-@@ -541,6 +541,16 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
+@@ -260,6 +260,7 @@ def supported_model(model_name: str | None = None, family: str | None = None) ->
+ 
+ def _here(path: Path) -> bool:
+     try:
++        path = _host_path(str(path))                       # local patch: an Intel start names the pack by its container path
+         return path.is_file() and path.stat().st_size > (1 << 20)
+     except OSError:
+         return False
+@@ -541,6 +542,16 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
      return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
  
  
@@ -19,7 +27,7 @@ index 56aa2c9c..29e6338c 100644
  def mtp_ready(args: list[Any]) -> bool | None:
      """Is the MTP layer this start would load on this computer? ``--mtp <folder>`` with its ``experts.bin`` (or, on a Mac, ``mtp-q2_0.gguf`` beside the folder).
      None (not known, taken as there) when the arguments name no layer at all (an Intel route, or a layer switched off) or a draft depth instead of a folder (Qwen3.6's
-@@ -551,7 +561,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
+@@ -551,7 +562,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
      value = _flag_value(args, "--mtp")
      if value is None or value.isdigit():
          return None
@@ -28,19 +36,17 @@ index 56aa2c9c..29e6338c 100644
      try:
          return (folder / "experts.bin").is_file() or (folder.parent / "mtp-q2_0.gguf").is_file()
      except OSError:
-@@ -634,11 +644,11 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
+@@ -634,10 +645,10 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
      """The draft vocabulary DFlash2 reads its draft head from: the person's own ``--mtp-draft-vocab``, else the one in the model's MTP folder (the subset the
      person chose in setup), else the copy the DFlash2 install keeps, else the default subset Strata ships. None when none of them is on this computer."""
      given = _flag_value(args, "--mtp-draft-vocab")
 -    if given and Path(given).is_file():
 -        return Path(given)
 +    if given and _host_path(given).is_file():
-+        return _host_path(given)
++        return Path(given)                                 # local patch: checked on the host, named as the engine sees it
      folder = _flag_value(args, "--mtp")
 -    if folder and not folder.isdigit() and (Path(folder) / VOCAB_NAME).is_file():
--        return Path(folder) / VOCAB_NAME
 +    if folder and not folder.isdigit() and (_host_path(folder) / VOCAB_NAME).is_file():
-+        return _host_path(folder) / VOCAB_NAME
+         return Path(folder) / VOCAB_NAME
      if data_dir and vocab_target(data_dir).is_file():
          return vocab_target(data_dir)
-     shipped = shipped_vocab()

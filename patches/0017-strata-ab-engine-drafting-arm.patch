@@ -1,0 +1,13 @@
+diff --git a/tools/ab_engine.py b/tools/ab_engine.py
+index adb6dc28..ab01bb5d 100644
+--- a/tools/ab_engine.py
++++ b/tools/ab_engine.py
+@@ -92,6 +92,8 @@ def main() -> int:
+                 cfg["exe"] = e.pop("exe")
+             if "xargs" in e:                       # extra engine arguments, ';'-separated
+                 cfg["args"] = list(base["args"]) + e.pop("xargs").split(";")
++            if "drafting" in e:                    # the config's drafter choice: auto | mtp | dflash2 | off
++                cfg["drafting"] = e.pop("drafting")
+             cfg["port"] = a.port
+             cfg["log"] = str(Path(tempfile.gettempdir()) / f"ab_{name}_r{rnd}.log")
+             cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
