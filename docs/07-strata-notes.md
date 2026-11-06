@@ -47,7 +47,15 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   here carry `"env": {"STRATA_PREFILL_MMQ": "off"}`: parity with 0.1.45 by default, int8 as an opt-in, the same call
   as for the KREG kernels. Reported upstream on 2026-10-28: the launcher dropping `=0` is Strata #4546, the auto
   default's speed and per-start crossover on the B70 is #4547, setup's version check is #4544, and the A/B tool's log
-  reuse is #4545.
+  reuse is #4545. Follow-up 2026-11-05, after the 0.2.11 release closed every report older than a week as stale: #4544
+  and #4545 were re-checked (both files byte-identical in v0.2.11, the setup check still reads the launcher as 0.1.12)
+  and reopened through the `/reopen` bot, which only accepts a "Strata version" field that starts with a bare `0.2.x`.
+  #4547 stayed closed on purpose: 0.2.10's launcher already sets `STRATA_CACHE_DIR=/work/.strata-cache` (its PR #3248
+  commit of 2026-10-31), so the crossover now persists, and a 2-round re-run on the 0.1.56 engine (Flash-Next IQ3_S,
+  DFlash2 drafter, greedy, 256 new tokens, fresh engine per start) read the 6,345-token prompt at 1,728 tok/s with the
+  cached crossover against 1,604-1,615 for the FP16 chain (one start each; the start that measured read it at 1,255),
+  with the same greedy answer on both auto starts. The configs here still carry `off` for now: one warm start is not
+  enough to switch, and the auto answer still differs from the FP16 one.
 - **Engine update to 0.2.7.1 / engine 0.1.53** (2026-10-28; two tags after 0.2.6, a DGX Spark / Mac DeepSeek /
   NVIDIA-and-Radeon-defaults release whose notes say Metal and SYCL got no speed change). Incremental build in the same
   image (4 minutes), the same setup line, no config change needed. The 0.2.7 speed defaults (residency-biased routing
