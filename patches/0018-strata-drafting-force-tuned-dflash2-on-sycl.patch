@@ -1,0 +1,11 @@
+--- a/strata_control/drafting.py
++++ b/strata_control/drafting.py
+@@ -374,6 +374,8 @@
+ 
+ def tuned_entry(backend: str | None, model_name: str | None) -> SetDefault | None:
+     """The table entry when this set on this engine family uses the tuned pack at all (whether THIS card qualifies is tuned_applies)."""
++    if backend == "sycl" and os.environ.get("STRATA_LOCAL_TUNED_SYCL") == "1":     # local test switch (lab A/B): the bf16sel tuned pack on any Arc set, Arc's own conf
++        return SetDefault("dflash2", True, None, "", "bf16sel")
+     entry = default_for(backend, model_name)
+     return entry if entry is not None and entry.drafter == "dflash2" and entry.tuned else None
+ 

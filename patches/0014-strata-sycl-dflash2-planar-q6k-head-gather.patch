@@ -1,5 +1,5 @@
 diff --git a/sycl/src/core/dflash2.cpp b/sycl/src/core/dflash2.cpp
-index 0ab23a15..79b51891 100644
+index 0ab23a157..79b518916 100644
 --- a/sycl/src/core/dflash2.cpp
 +++ b/sycl/src/core/dflash2.cpp
 @@ -300,7 +300,19 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s

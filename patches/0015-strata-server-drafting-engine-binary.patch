@@ -1,8 +1,8 @@
 diff --git a/serve/server.py b/serve/server.py
-index f690d618..0c54ed8d 100644
+index c12eb6598..5a47d4eb8 100644
 --- a/serve/server.py
 +++ b/serve/server.py
-@@ -3509,7 +3509,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) ->
+@@ -3899,7 +3899,8 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) ->
      parallel_n = cfg.get("parallel")
      decision = drafting.apply(shaped, klass=drafting_card_class(), data_dir=drafting.data_dir_of(args), backend=backend, archs=archs,
                                vram_mib=drafting_vram_mib(cfg, backend, archs),

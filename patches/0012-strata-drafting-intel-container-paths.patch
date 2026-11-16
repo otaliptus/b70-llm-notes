@@ -1,8 +1,8 @@
 diff --git a/strata_control/drafting.py b/strata_control/drafting.py
-index 56aa2c9c..39096388 100644
+index 1200216c0..72eb0f5c5 100644
 --- a/strata_control/drafting.py
 +++ b/strata_control/drafting.py
-@@ -260,6 +260,7 @@ def supported_model(model_name: str | None = None, family: str | None = None) ->
+@@ -612,6 +612,7 @@ def file_fit(args: list[Any], data_dir: str | Path | None = None) -> str:
  
  def _here(path: Path) -> bool:
      try:
@@ -10,7 +10,16 @@ index 56aa2c9c..39096388 100644
          return path.is_file() and path.stat().st_size > (1 << 20)
      except OSError:
          return False
-@@ -541,6 +542,16 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
+@@ -648,7 +649,7 @@ def converted_ok(data_dir: str | Path | None, *, size: int | None = None, sha256
+         return False
+     want_size = CONVERTED_BYTES if size is None else size
+     want_sha = CONVERTED_SHA256 if sha256 is None else sha256
+-    path = Path(data_dir) / FOLDER / (name or CONVERTED_NAME)
++    path = _host_path(str(Path(data_dir) / FOLDER / (name or CONVERTED_NAME)))       # local patch: an Intel start names the data dir by its container path
+     try:
+         stat = path.stat()
+         if not path.is_file() or stat.st_size != want_size:
+@@ -1062,6 +1063,16 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0, named: b
      return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
  
  
@@ -27,7 +36,7 @@ index 56aa2c9c..39096388 100644
  def mtp_ready(args: list[Any]) -> bool | None:
      """Is the MTP layer this start would load on this computer? ``--mtp <folder>`` with its ``experts.bin`` (or, on a Mac, ``mtp-q2_0.gguf`` beside the folder).
      None (not known, taken as there) when the arguments name no layer at all (an Intel route, or a layer switched off) or a draft depth instead of a folder (Qwen3.6's
-@@ -551,7 +562,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
+@@ -1072,7 +1083,7 @@ def mtp_ready(args: list[Any]) -> bool | None:
      value = _flag_value(args, "--mtp")
      if value is None or value.isdigit():
          return None
@@ -36,7 +45,7 @@ index 56aa2c9c..39096388 100644
      try:
          return (folder / "experts.bin").is_file() or (folder.parent / "mtp-q2_0.gguf").is_file()
      except OSError:
-@@ -634,10 +645,10 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
+@@ -1350,10 +1361,10 @@ def vocab_path(args: list[Any], data_dir: str | Path | None = None) -> Path | No
      """The draft vocabulary DFlash2 reads its draft head from: the person's own ``--mtp-draft-vocab``, else the one in the model's MTP folder (the subset the
      person chose in setup), else the copy the DFlash2 install keeps, else the default subset Strata ships. None when none of them is on this computer."""
      given = _flag_value(args, "--mtp-draft-vocab")

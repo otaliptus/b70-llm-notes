@@ -81,7 +81,7 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   model runs with no drafter at all: chat decode 37-39 tok/s instead of 51-58; `"drafting": "mtp"` in the config does not
   help on its own), and [`patches/0013`](../patches/0013-strata-server-intel-engine-args-kwargs.patch), because the Intel
   server's two-card hook wraps `engine_args(cfg)` and the server now calls it with `announce=False`, so `server_intel.py`
-  dies at start with a TypeError. With both patches, `"drafting": "mtp"` pinned in every config, the MTP layer loaded and
+  dies at start with a TypeError (fixed upstream in 0.2.11; 0013 is only for 0.2.10). With both patches, `"drafting": "mtp"` pinned in every config, the MTP layer loaded and
   the FP16 prompt path from the previous bullet, the A/B against the 0.2.7.1 engine (greedy, 256 new tokens, three
   alternating rounds, fresh engine per arm): Flash-Next IQ3_S chat decode 50.5 to 52.9 tok/s, decode after a 6,345-token
   prompt 45.6 to 48.6, prompt reading 1364 to 1615 tok/s at 6.3k and 1418 to 1760 at 21k; chat answers identical, the
@@ -111,6 +111,23 @@ Strata is the engine used for the two Qwen3.8-era MoE models. Notes specific to 
   slots than the MTP layer. The `--spec 6 --draft-conf 0.6` are what Strata picks for SYCL. The launcher drops a value of
   exactly `0` (#4546), so testing the switch needed a one-line launcher allowance (patch 0016); patch 0017 gives the A/B tool a
   per-arm `drafting=` key. Filed upstream as #5286 (with the fix), plus confirming comments on #5138 and #4546.
+- **0.2.15 (SYCL engine 0.1.59) on the B70** (2026-11-16). Five tags since 0.2.10; the Intel engine moved to 0.1.59 in 0.2.13
+  (about 14k changed lines under `sycl/`: decode kernels, prompt path, a fixed-order bf16 kernel for Arc determinism) and stayed
+  there through 0.2.15, whose own changes are app/Terminal drafting fixes. Same recipe as before (Dockerfile and `build.sh`
+  unchanged, incremental build about five minutes, setup leaves the configs alone and still prints the #4544 warning). Upstream
+  fixed the server hook crash in 0.2.11, so patch 0013 is no longer needed; 0011, 0012 and 0014-0017 still are and apply
+  unchanged (#5286 is open, and another B70 user confirmed it on a stock Unsloth UD-IQ4_XS v3.1 pack). Patch 0012 now also maps
+  the `/work` path in `converted_ok()`: without it the tuned or converted DFlash2 pack is never found on an Intel install and the
+  stock pack is used silently. A/B, 0.1.56 against 0.1.59 engine, same serve code, greedy, 256 new tokens, three alternating rounds
+  of three chats and a 6,345-token prompt (two rounds of a 21k prompt), medians: Flash-Next IQ3_S with DFlash2, chat decode
+  54.9 to 55.2 tok/s, after 6.3k 49.4 to 47.7 (-3.4 %), after 21k 48.2 to 45.6 (-5.4 %), prompt reading 0.6 to 0.9 % lower;
+  Swift IQ3_S with MTP, chat 50.2 to 50.6, after 6.3k 46.6 to 47.3. All chat and 6.3k answers identical between engines; the 21k
+  greedy answer differs (each engine is stable across its own rounds). **The tuned DFlash2 drafter** (Strata's fine-tuned pack in
+  the bf16-selector form the SYCL engine reads, 0.52 GB; Auto uses it only on Arc A-series with IQ3_XXS) was tried on Flash-Next
+  IQ3_S with [`patches/0018`](../patches/0018-strata-drafting-force-tuned-dflash2-on-sycl.patch), an env switch for the test
+  (`STRATA_LOCAL_TUNED_SYCL=1`), at Arc's own `--draft-conf 0.6`, three rounds against the stock pack: the two prose chats +5.6 and
+  +6.2 %, the code chat -1.5 %, decode after 6.3k -1.9 %, acceptance a few points higher on prose, all 12 answers identical,
+  run-to-run spread under 0.2 tok/s. Mixed, so the stock pack stays. Not tried: the tuned pack at 0.5.
 - **A GGUF that keeps the MTP head inside the file** (2026-10-23, bottlecapai's ThinkingCap-Qwen3.8-Flash-Next-GGUF:
   `qwen4exp.block_count = 49`, `nextn_predict_layers = 1`, 32 `blk.48.*` tensors across shards 3-7, 49-entry
   `attention.compress_ratios` / `recurrent_layers`; llama.cpp's own converter drops the head, so no earlier Flash-Next

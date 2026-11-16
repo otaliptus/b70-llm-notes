@@ -1,5 +1,5 @@
 diff --git a/sycl/serve/strata-sycl.sh b/sycl/serve/strata-sycl.sh
-index fcf31f0b..5a2f35b4 100755
+index fcf31f0b4..5a2f35b4e 100755
 --- a/sycl/serve/strata-sycl.sh
 +++ b/sycl/serve/strata-sycl.sh
 @@ -39,7 +39,11 @@ done < <(compgen -e)

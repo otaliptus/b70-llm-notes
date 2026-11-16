@@ -1,8 +1,8 @@
 diff --git a/tools/iq_pack.py b/tools/iq_pack.py
-index cb361824..a314b606 100644
+index 7f2e87ed3..555020e86 100644
 --- a/tools/iq_pack.py
 +++ b/tools/iq_pack.py
-@@ -220,6 +220,26 @@ def tensor_bytes(mm, g, t) -> np.ndarray:
+@@ -219,6 +219,26 @@ def tensor_bytes(mm, g, t) -> np.ndarray:
      return mm[g.data_start + t.offset: g.data_start + t.offset + n]
  
  
@@ -29,7 +29,7 @@ index cb361824..a314b606 100644
  def is_expert(name: str) -> bool:
      return name.startswith("blk.") and name.endswith(("_exps.weight",))
  
-@@ -276,9 +296,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+@@ -275,9 +295,14 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
      """Every non-expert tensor of the model: the floats the engine reads from the pack into dense.bin in the form it
      reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
      todo, problems = [], []
@@ -44,7 +44,7 @@ index cb361824..a314b606 100644
          if len(t.shape) > 2:
              print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
              return 1
-@@ -290,6 +315,9 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+@@ -289,6 +314,9 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
          if t.type_name not in FLOAT and not native and not compat_bf16:
              problems.append(f"{name} is {t.type_name}, but the engine requires {form}; use --compat-bf16")
          todo.append((name, g, t, mm, p, native))
@@ -54,7 +54,7 @@ index cb361824..a314b606 100644
      # refused before anything is written: the previous pack stays as it was
      if problems:
          for m in problems[:8]:
-@@ -436,7 +464,7 @@ def expert_layout(model: Model, src: pathlib.Path):
+@@ -435,7 +463,7 @@ def expert_layout(model: Model, src: pathlib.Path):
      exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
      if not exps:
          return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
