@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 06:30:18 +0000
+Subject: [PATCH] SYCL Inkling router fusion: NaN-safe ranks;
+ INKLING_LONG_FA=1 long-KV per-head-mask FA tests; weight names in OPPROF keys
+
+With all fusions a 90k-token prompt (FA on) hit GGML_ASSERT(row_id_i ... < n_as) in the prompt MUL_MAT_ID: the
+rank argsort leaves slots unwritten when a score is NaN, the unfused argsort still returns a permutation. NaN
+scores now rank as -inf. Not yet known which upstream node made the NaN (with router, mix and relmask fusions
+off the same prompt runs). FA per-head-mask tests at kv 65536/69632/98304 pass vs CPU.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/inkling-fuse.cpp | 3 ++-
+ tests/test-backend-ops.cpp          | 8 ++++++++
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-sycl/inkling-fuse.cpp b/ggml/src/ggml-sycl/inkling-fuse.cpp
+index 8a3b6cc..c140ab5 100644
+--- a/ggml/src/ggml-sycl/inkling-fuse.cpp
++++ b/ggml/src/ggml-sycl/inkling-fuse.cpp
+@@ -363,7 +363,8 @@ int fuse_router_impl(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, in
+                 const float lg = ld[tk * lnb1 + e];
+                 const float p = 1.0f / (1.0f + sycl::exp(-lg));
+                 p_l[e] = p;
+-                b_l[e] = p + bd[e];
++                const float bv = p + bd[e];
++                b_l[e] = sycl::isnan(bv) ? -INFINITY : bv;  // a total order, so the ranks stay a permutation
+             }
+             sycl::group_barrier(it.get_group());
+             if (e < nE) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 549bb64..86b838c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13642,6 +13642,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+ 
+     // a mask per Q head (Inkling 2 relative-position bias added to the mask): 8 KV heads, 3 Q heads each
++    if (getenv("INKLING_LONG_FA")) {  // long-context per-head-mask cases (slow CPU reference)
++        for (int64_t kv : { 65536, 69632, 98304 }) {
++            for (int64_t nb : { 1, 16 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,
++                    GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 24));
++            }
++        }
++    }
+     for (int64_t mh : { 24, 8 }) {
+         for (int64_t kv : { 256, 1024, 4096 }) {
+             for (int64_t nb : { 1, 3, 64 }) {
+-- 
+2.47.3
+

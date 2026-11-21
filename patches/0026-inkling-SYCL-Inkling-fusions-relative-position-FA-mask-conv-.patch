@@ -1,0 +1,878 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 05:31:53 +0000
+Subject: [PATCH] SYCL Inkling fusions: relative-position FA mask, conv
+ state store, router logits; parallel mix/control/relmask kernels
+
+- relmask: the per-head FA mask (PAD MUL_MAT SUB CONT GET_ROWS CONT CPY ADD CPY) as 2 kernels, reads the unpadded bias
+- convstore: CONCAT(past, x) + the state CPY as one kernel
+- router: the f32 logits mat-vec folded in (4 sub-groups per expert)
+- mix: 2 kernels (per-row reductions, then output chunks), was one work-group per token (26.7 -> 12.4 us)
+- control: the down projection split into quarters (14.7 -> 12.1 us); <= 8 tokens only (prompt GEMMs are faster)
+- span check counts self-references (ggml_cast CPY src[1] == itself); exact alias allowed for single-query mix
+- inkling2.cpp: no ggml_cont of row views that are already contiguous (single-token decode), SWA reuses input 0
+- profiling: GGML_SYCL_OPPROF=2 + GGML_SYCL_QUEUE_PROFILING=1 gives GPU barrier timestamps per node; fusion names
+Decode 2247 launches; NVFP4-Q8_0 tg64 56.7 -> 59.6, pp512 646 -> 752 (FA on).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/dpct/helper.hpp  |  10 +
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  25 ++
+ ggml/src/ggml-sycl/inkling-fuse.cpp | 530 +++++++++++++++++++++-------
+ ggml/src/ggml-sycl/inkling-fuse.hpp |   3 +
+ src/models/inkling2.cpp             |  16 +-
+ 5 files changed, 460 insertions(+), 124 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/dpct/helper.hpp b/ggml/src/ggml-sycl/dpct/helper.hpp
+index fd3b965..6c2e2ce 100644
+--- a/ggml/src/ggml-sycl/dpct/helper.hpp
++++ b/ggml/src/ggml-sycl/dpct/helper.hpp
+@@ -806,6 +806,11 @@ namespace dpct
+         if (enable_exception_handler) {
+           eh = exception_handler;
+         }
++        if (getenv("GGML_SYCL_QUEUE_PROFILING")) {  // local: GPU timestamps for GGML_SYCL_OPPROF=2
++          _queues.push_back(sycl::queue(*this, eh,
++              sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
++          return _queues.back();
++        }
+         _queues.push_back(sycl::queue(
+             *this, eh,
+             sycl::property_list(
+@@ -825,6 +830,11 @@ namespace dpct
+         if (enable_exception_handler) {
+           eh = exception_handler;
+         }
++        if (getenv("GGML_SYCL_QUEUE_PROFILING")) {
++          _queues.push_back(sycl::queue(device, eh,
++              sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
++          return _queues.back();
++        }
+         _queues.push_back(sycl::queue(
+             device, eh,
+                         sycl::property_list(
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 6e49ab8..851fe4a 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6724,6 +6724,12 @@ static std::string sycl_opprof_key(const ggml_tensor * node) {
+     std::string k = ggml_op_desc(node);
+     k += "|"; k += node->src[0] ? ggml_type_name(node->src[0]->type) : "-";
+     k += "|"; k += name;
++    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] && node->src[0]->name[0] == 'b') {
++        std::string w = node->src[0]->name;  // blk.N.attn_q.weight -> attn_q
++        size_t d1 = w.find('.'), d2 = d1 == std::string::npos ? d1 : w.find('.', d1 + 1);
++        if (d2 != std::string::npos) w = w.substr(d2 + 1);
++        k += "|"; k += w;
++    }
+     return k;
+ }
+ static void sycl_opprof_print() {
+@@ -6767,8 +6773,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+ static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph, bool prof) {
+     std::string prof_key;
+     auto prof_t = std::chrono::steady_clock::now();
++    // GGML_SYCL_OPPROF=2 (needs GGML_SYCL_QUEUE_PROFILING=1): a barrier after each node, no host waits; the GPU
++    // time of a node is the gap between the end timestamps of the barriers around it
++    static const int prof_mode = ggml_sycl_get_env("GGML_SYCL_OPPROF", 0);
++    std::vector<std::pair<std::string, sycl::event>> prof_ev;
+     auto prof_flush = [&]() {
+         if (!prof) return;
++        if (prof_mode == 2) {
++            prof_ev.emplace_back(prof_key, sycl_ctx->stream()->ext_oneapi_submit_barrier());
++            return;
++        }
+         sycl_ctx->stream()->wait();
+         auto t = std::chrono::steady_clock::now();
+         if (!prof_key.empty()) {
+@@ -6778,6 +6792,7 @@ static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context
+         prof_t = t;
+     };
+     if (prof) { sycl_ctx->stream()->wait(); prof_t = std::chrono::steady_clock::now(); }
++    if (prof && prof_mode == 2) { prof_key.clear(); prof_ev.reserve(4096); prof_flush(); }
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+         if (ggml_sycl_is_view_or_noop(node)) {
+@@ -6791,6 +6806,7 @@ static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context
+         {
+             const int inkling_skip = ggml_sycl_inkling_fuse(*sycl_ctx, cgraph, i);
+             if (inkling_skip > 0) {
++                if (prof) { prof_key = std::string("IFUSE|") + ggml_sycl_inkling_fuse_last(); }
+                 i += inkling_skip;
+                 continue;
+             }
+@@ -6899,6 +6915,15 @@ static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context
+         GGML_ASSERT(ok);
+     }
+     prof_flush();
++    if (prof && prof_mode == 2) {
++        sycl_ctx->stream()->wait();
++        for (size_t k = 1; k < prof_ev.size(); ++k) {
++            const uint64_t t0 = prof_ev[k - 1].second.get_profiling_info<sycl::info::event_profiling::command_end>();
++            const uint64_t t1 = prof_ev[k].second.get_profiling_info<sycl::info::event_profiling::command_end>();
++            auto & e = g_opprof[prof_ev[k].first];
++            e.us += (double) (t1 - t0) / 1000.0; e.n++;
++        }
++    }
+ }
+ 
+ #ifdef GGML_SYCL_GRAPH
+diff --git a/ggml/src/ggml-sycl/inkling-fuse.cpp b/ggml/src/ggml-sycl/inkling-fuse.cpp
+index 8130893..8a3b6cc 100644
+--- a/ggml/src/ggml-sycl/inkling-fuse.cpp
++++ b/ggml/src/ggml-sycl/inkling-fuse.cpp
+@@ -9,7 +9,7 @@
+ // view nodes inside the span). Anything unexpected returns 0 and the nodes run one by one.
+ //
+ // GGML_SYCL_IFUSE=<bitmask> (default all): 1 clip, 2 MoE router, 4 SITU (+ expert scale), 8 expert combine,
+-// 16 mix, 32 control, 64 conv tail.
++// 16 mix, 32 control, 64 conv tail, 128 relative-position FA mask, 256 conv input + state store.
+ 
+ #include "inkling-fuse.hpp"
+ 
+@@ -25,7 +25,7 @@ namespace {
+ constexpr int SG = 16;
+ 
+ int ifuse_mask() {
+-    static const int m = ggml_sycl_get_env("GGML_SYCL_IFUSE", 0x7f);
++    static const int m = ggml_sycl_get_env("GGML_SYCL_IFUSE", 0x1ff);
+     return m;
+ }
+ 
+@@ -81,7 +81,7 @@ bool span_ok(const ggml_cgraph * cg, int first, int last, const ggml_tensor * co
+             return false;
+         }
+         int uses = 0;
+-        for (int j = i + 1; j <= last; ++j) {
++        for (int j = i; j <= last; ++j) {
+             for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                 if (cg->nodes[j]->src[s] == t) {
+                     uses++;
+@@ -90,6 +90,10 @@ bool span_ok(const ggml_cgraph * cg, int first, int last, const ggml_tensor * co
+         }
+         if (uses != ggml_node_get_use_count(cg, i)) {
+             if (!t->view_src || !in_list(view_root(t), outs, n_outs)) {
++                if (ggml_sycl_get_env("GGML_SYCL_IFUSE_DEBUG", 0) >= 3) {
++                    fprintf(stderr, "IFUSE span: %s (%s) uses %d in span, %d total\n", t->name, ggml_op_desc(t), uses,
++                            ggml_node_get_use_count(cg, i));
++                }
+                 return false;
+             }
+         }
+@@ -111,6 +115,12 @@ bool same_or_disjoint(const ggml_tensor * out, const ggml_tensor * in) {
+     return out->data == in->data && ggml_are_same_shape(out, in) && ggml_is_contiguous(out) && ggml_is_contiguous(in);
+ }
+ 
++int ifuse_debug() {
++    static const int d = ggml_sycl_get_env("GGML_SYCL_IFUSE_DEBUG", 0);
++    return d;
++}
++#define IFUSE_REJECT(what, t) do { if (ifuse_debug() >= 2) fprintf(stderr, "IFUSE reject %s at %s line %d\n", what, (t)->name, __LINE__); return 0; } while (0)
++
+ bool f32_rows(const ggml_tensor * t) {
+     return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float);
+ }
+@@ -176,11 +186,11 @@ int fuse_clip(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+         return 0;
+     }
+     if (!same_or_disjoint(mul, x) || (s && overlaps(mul, s))) {
+-        return 0;
++        IFUSE_REJECT("clip overlap", mul);
+     }
+     const ggml_tensor * outs[] = { mul };
+     if (!span_ok(cg, i, last, outs, 1)) {
+-        return 0;
++        IFUSE_REJECT("clip span", mul);
+     }
+     const float a = op_f(sc, 0), b = op_f(sc, 1), thr = op_f(fill, 0), lo = op_f(clamp, 0), hi = op_f(clamp, 1);
+     const float * xd = (const float *) x->data;
+@@ -215,7 +225,68 @@ int fuse_clip(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+ // ---------------------------------------------------------------------------------------------------------------
+ // 2. MoE router: SIGMOID ADD(bias) ARGSORT(desc) GET_ROWS(probs, topk) SUM_ROWS SCALE(1, eps) DIV SCALE(w)
+ //    one work-group per token, n_expert <= 256; writes the full argsort and the scaled weights
++// the router logits mat-vec before it: W F32 [K, n_exp], x F32 [K, n_tok]; 4 sub-groups per (expert, token)
++bool router_logits(ggml_backend_sycl_context & ctx, const ggml_tensor * mm) {
++    const ggml_tensor * W = mm->src[0], * x = mm->src[1];
++    if (W->type != GGML_TYPE_F32 || !ggml_is_contiguous(W) || W->ne[2] != 1 || x->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(x) || x->ne[0] != W->ne[0] || x->ne[2] != 1 || !ggml_is_contiguous(mm) ||
++        mm->type != GGML_TYPE_F32 || overlaps(mm, x) || overlaps(mm, W) || x->ne[1] > 8) {
++        return false;
++    }
++    const int64_t K = W->ne[0], n_exp = W->ne[1], n_tok = x->ne[1];
++    const float * wd = (const float *) W->data;
++    const float * xd = (const float *) x->data;
++    float * od = (float *) mm->data;
++    constexpr int WGL = 4 * SG;
++    ctx.stream()->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> part(WGL / SG, cgh);
++        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tok, n_exp * WGL), sycl::range<2>(1, WGL)),
++                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
++            const int64_t tk = it.get_group(0), r = it.get_group(1);
++            const int l = it.get_local_id(1);
++            float acc = 0.0f;
++            const sycl::float4 * w4 = (const sycl::float4 *) (wd + r * K);
++            const sycl::float4 * x4 = (const sycl::float4 *) (xd + tk * K);
++            for (int64_t k = l; k < K / 4; k += WGL) {
++                const sycl::float4 a = w4[k], b = x4[k];
++                acc += a.x() * b.x() + a.y() * b.y() + a.z() * b.z() + a.w() * b.w();
++            }
++            auto sg = it.get_sub_group();
++            acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
++            if (sg.leader()) {
++                part[l / SG] = acc;
++            }
++            sycl::group_barrier(it.get_group());
++            if (l == 0) {
++                od[tk * n_exp + r] = part[0] + part[1] + part[2] + part[3];
++            }
++        });
++    });
++    return true;
++}
++
++int fuse_router_impl(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i, const ggml_tensor * mm);
++
++// MUL_MAT(logits) + the router below; 0 if the router does not match (nothing launched)
++int fuse_router_mm(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
++    const ggml_tensor * mm = cg->nodes[i];
++    int idx[2];
++    if (collect(cg, i, 2, idx) < 0) {
++        return 0;
++    }
++    const ggml_tensor * sig = cg->nodes[idx[1]];
++    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || sig->src[0] != mm ||
++        (mm->src[0]->ne[0] % 4) != 0 || ((uintptr_t) mm->src[1]->data % 16) != 0 || ((uintptr_t) mm->src[0]->data % 16) != 0) {
++        return 0;
++    }
++    return fuse_router_impl(ctx, cg, idx[1], mm);
++}
++
+ int fuse_router(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
++    return fuse_router_impl(ctx, cg, i, nullptr);
++}
++
++int fuse_router_impl(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i, const ggml_tensor * mm) {
+     if (cg->nodes[i]->op != GGML_OP_UNARY || ggml_get_unary_op(cg->nodes[i]) != GGML_UNARY_OP_SIGMOID) {
+         return 0;
+     }
+@@ -259,6 +330,21 @@ int fuse_router(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+     if (!span_ok(cg, i, last, outs, 2)) {
+         return 0;
+     }
++    int first = i;
++    if (mm) {
++        // the logits are read only by the sigmoid, and the mat-vec must be launchable
++        int mi = -1;
++        for (int j = i - 1; j >= 0 && j >= i - 4; --j) {
++            if (cg->nodes[j] == mm) {
++                mi = j;
++            }
++        }
++        if (mi < 0 || ggml_node_get_use_count(cg, mi) != 1 || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            overlaps(as, mm) || overlaps(wsc, mm) || !router_logits(ctx, mm)) {
++            return 0;
++        }
++        first = mi;
++    }
+     const float e_a = op_f(eps, 0), e_b = op_f(eps, 1), w_a = op_f(wsc, 0), w_b = op_f(wsc, 1);
+     const float * ld = (const float *) logits->data;
+     const size_t  lnb1 = logits->nb[1] / sizeof(float);
+@@ -305,7 +391,7 @@ int fuse_router(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+             }
+         });
+     });
+-    return last - i;
++    return last - first;
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+@@ -628,15 +714,24 @@ int fuse_mix(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+             return 0;
+         }
+     }
++    // an input row may be the output's own memory (ggml-alloc in place of a dead row) when it is the same
++    // [n_embd, n_tok] layout and there is one query: a work-group reads and writes only its token, and a
++    // work-item writes element e only after it read e of every row (the first pass has a barrier after it)
+     for (int k = 0; k < n_cat; ++k) {
+         const ggml_tensor * c = cg->nodes[idx[k]];
+-        if (overlaps(mm2, c->src[0]) || overlaps(mm2, c->src[1])) {
+-            return 0;
++        for (const ggml_tensor * src : { c->src[0], c->src[1] }) {
++            if (k > 0 && src == cg->nodes[idx[k - 1]]) {
++                continue;  // the previous concatenation, not read by the kernel
++            }
++            if (overlaps(mm2, src) &&
++                !(n_q == 1 && src->data == mm2->data && src->nb[2] == (size_t) n_embd * sizeof(float))) {
++                IFUSE_REJECT("mix overlap", mm2);
++            }
+         }
+     }
+     const ggml_tensor * outs[] = { mm2 };
+     if (!span_ok(cg, i, last, outs, 1)) {
+-        return 0;
++        IFUSE_REJECT("mix span", mm2);
+     }
+     const float eps = op_f(rms, 0);
+     const float scale = op_f(sm, 0);
+@@ -645,83 +740,84 @@ int fuse_mix(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+     float * od = (float *) mm2->data;
+     const int nR = (int) n_rows, nQ = (int) n_q;
+     constexpr int WG = 256;
++    // kernel 1: one work-group per (token, row): sum of squares and the dots with the queries -> red[t][b][q+1]
++    ggml_sycl_pool_alloc<float> red_alloc(ctx.pool(), n_tok * nR * (MIX_MAX_Q + 1));
++    float * redd = red_alloc.get();
+     ctx.stream()->submit([&](sycl::handler & cgh) {
+-        sycl::local_accessor<float, 1> red(WG / SG * MIX_MAX_ROWS * (MIX_MAX_Q + 1), cgh);
+-        sycl::local_accessor<float, 1> wts(MIX_MAX_ROWS * MIX_MAX_Q, cgh);
+-        cgh.parallel_for(sycl::nd_range<1>(n_tok * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++        sycl::local_accessor<float, 1> part(WG / SG * (MIX_MAX_Q + 1), cgh);
++        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tok, nR * WG), sycl::range<2>(1, WG)),
++                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+             const int64_t tk = it.get_group(0);
+-            const int l = it.get_local_id(0);
+-            const int sg = l / SG;
+-            auto sgr = it.get_sub_group();
+-            // per row: sum of squares and the dots with each query
+-            float acc[MIX_MAX_ROWS][MIX_MAX_Q + 1];
+-            for (int b = 0; b < nR; ++b) {
+-                for (int q = 0; q <= nQ; ++q) {
+-                    acc[b][q] = 0.0f;
+-                }
+-            }
++            const int b = it.get_group(1);
++            const int l = it.get_local_id(1);
++            const float * x = rows.p[b] + tk * rows.nb_t[b];
++            float a[MIX_MAX_Q + 1] = { 0.0f };
+             for (int64_t e = l; e < n_embd; e += WG) {
+-                float qv[MIX_MAX_Q];
+-                for (int q = 0; q < nQ; ++q) {
+-                    qv[q] = qd[q * q_nb1 + e];
+-                }
+-                for (int b = 0; b < nR; ++b) {
+-                    const float x = rows.p[b][tk * rows.nb_t[b] + e];
+-                    acc[b][0] += x * x;
+-                    for (int q = 0; q < nQ; ++q) {
+-                        acc[b][q + 1] += x * qv[q];
++                const float v = x[e];
++                a[0] += v * v;
++#pragma unroll
++                for (int q = 0; q < MIX_MAX_Q; ++q) {
++                    if (q < nQ) {
++                        a[q + 1] += v * qd[q * q_nb1 + e];
+                     }
+                 }
+             }
+-            for (int b = 0; b < nR; ++b) {
+-                for (int q = 0; q <= nQ; ++q) {
+-                    const float v = sycl::reduce_over_group(sgr, acc[b][q], sycl::plus<float>());
+-                    if (sgr.leader()) {
+-                        red[(sg * MIX_MAX_ROWS + b) * (MIX_MAX_Q + 1) + q] = v;
++            auto sg = it.get_sub_group();
++#pragma unroll
++            for (int q = 0; q <= MIX_MAX_Q; ++q) {
++                if (q <= nQ) {
++                    const float v = sycl::reduce_over_group(sg, a[q], sycl::plus<float>());
++                    if (sg.leader()) {
++                        part[(l / SG) * (MIX_MAX_Q + 1) + q] = v;
+                     }
+                 }
+             }
+             sycl::group_barrier(it.get_group());
+-            if (l == 0) {
+-                float inv[MIX_MAX_ROWS];
+-                float sc[MIX_MAX_ROWS][MIX_MAX_Q];
++            if (l <= nQ) {
++                float t = 0.0f;
++                for (int s = 0; s < WG / SG; ++s) {
++                    t += part[s * (MIX_MAX_Q + 1) + l];
++                }
++                redd[(tk * nR + b) * (MIX_MAX_Q + 1) + l] = t;
++            }
++        });
++    });
++    // kernel 2: work-groups over (token, chunk of n_embd); each recomputes the tiny softmax, then writes its chunk
++    constexpr int WG2 = 256;
++    const int64_t n_chunk = (n_embd + WG2 - 1) / WG2;
++    ctx.stream()->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> wts(MIX_MAX_ROWS * MIX_MAX_Q, cgh);
++        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tok, n_chunk * WG2), sycl::range<2>(1, WG2)),
++                         [=](sycl::nd_item<2> it) {
++            const int64_t tk = it.get_group(0);
++            const int l = it.get_local_id(1);
++            if (l < nQ) {
++                const int q = l;
++                float inv[MIX_MAX_ROWS], sc[MIX_MAX_ROWS];
++                float mx = -INFINITY;
+                 for (int b = 0; b < nR; ++b) {
+-                    float t[MIX_MAX_Q + 1];
+-                    for (int q = 0; q <= nQ; ++q) {
+-                        t[q] = 0.0f;
+-                        for (int s = 0; s < WG / SG; ++s) {
+-                            t[q] += red[(s * MIX_MAX_ROWS + b) * (MIX_MAX_Q + 1) + q];
+-                        }
+-                    }
++                    const float * t = redd + (tk * nR + b) * (MIX_MAX_Q + 1);
+                     inv[b] = 1.0f / sycl::sqrt(t[0] / (float) n_embd + eps);
+-                    for (int q = 0; q < nQ; ++q) {
+-                        sc[b][q] = t[q + 1] * inv[b] * scale;
+-                    }
++                    sc[b] = t[q + 1] * inv[b] * scale;
++                    mx = sycl::fmax(mx, sc[b]);
+                 }
+-                for (int q = 0; q < nQ; ++q) {
+-                    float mx = -INFINITY;
+-                    for (int b = 0; b < nR; ++b) {
+-                        mx = sycl::fmax(mx, sc[b][q]);
+-                    }
+-                    float s = 0.0f;
+-                    for (int b = 0; b < nR; ++b) {
+-                        sc[b][q] = sycl::exp(sc[b][q] - mx);
+-                        s += sc[b][q];
+-                    }
+-                    for (int b = 0; b < nR; ++b) {
+-                        wts[b * MIX_MAX_Q + q] = sc[b][q] / s * inv[b];  // softmax weight times the row's 1/rms
+-                    }
++                float s = 0.0f;
++                for (int b = 0; b < nR; ++b) {
++                    sc[b] = sycl::exp(sc[b] - mx);
++                    s += sc[b];
++                }
++                for (int b = 0; b < nR; ++b) {
++                    wts[b * MIX_MAX_Q + q] = sc[b] / s * inv[b];  // softmax weight times the row's 1/rms
+                 }
+             }
+             sycl::group_barrier(it.get_group());
+-            for (int64_t e = l; e < n_embd; e += WG) {
+-                float o[MIX_MAX_Q];
+-                for (int q = 0; q < nQ; ++q) {
+-                    o[q] = 0.0f;
+-                }
++            const int64_t e = it.get_group(1) * WG2 + l;
++            if (e < n_embd) {
++                float o[MIX_MAX_Q] = { 0.0f };
+                 for (int b = 0; b < nR; ++b) {
+                     const float x = rows.p[b][tk * rows.nb_t[b] + e];
+-                    for (int q = 0; q < nQ; ++q) {
++#pragma unroll
++                    for (int q = 0; q < MIX_MAX_Q; ++q) {
+                         o[q] += wts[b * MIX_MAX_Q + q] * x;
+                     }
+                 }
+@@ -770,6 +866,9 @@ int fuse_control(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+         return 0;
+     }
+     const int64_t n_embd = cur->ne[0], n_tok = cur->ne[1], n_rank = Wd->ne[1];
++    if (n_tok > 8) {
++        return 0;  // prompt batches: the GEMMs of the unfused nodes read the weights once, this kernel per token
++    }
+     auto w_ok = [](const ggml_tensor * W) {
+         return (W->type == GGML_TYPE_BF16 || W->type == GGML_TYPE_F32) && ggml_is_contiguous(W) && W->ne[2] == 1 && W->ne[3] == 1;
+     };
+@@ -794,66 +893,52 @@ int fuse_control(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+     float * od = (float *) add->data;
+     const void * wd = Wd->data, * wf = Wf->data, * wg = Wg->data;
+     const bool d_bf16 = Wd->type == GGML_TYPE_BF16, fg_bf16 = Wf->type == GGML_TYPE_BF16;
+-    ggml_sycl_pool_alloc<float> h_alloc(ctx.pool(), n_rank * n_tok);
++    // kernel 1: per (token, rank row, quarter): the cur half (quarters 0, 1) or the msg half (2, 3) of the
++    // down row, partial dot and partial sum of squares -> part[t][r][q][2]
++    constexpr int NP = 4;
++    ggml_sycl_pool_alloc<float> h_alloc(ctx.pool(), n_rank * n_tok * NP * 2);
+     float * hd = h_alloc.get();
+     const int nE = (int) n_embd, nRk = (int) n_rank;
+-    // kernel 1: one work-group of 128 per (rank row, token): partial dots with both halves and the two sums of squares
+     {
+         constexpr int WG = 128;
+         ctx.stream()->submit([&](sycl::handler & cgh) {
+-            sycl::local_accessor<float, 1> red(4 * (WG / SG), cgh);
+-            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tok, n_rank * WG), sycl::range<2>(1, WG)),
++            sycl::local_accessor<float, 1> red(2 * (WG / SG), cgh);
++            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tok, n_rank * NP * WG), sycl::range<2>(1, WG)),
+                              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+                 const int64_t tk = it.get_group(0);
+-                const int rr = it.get_group(1);
++                const int g = it.get_group(1);
++                const int rr = g / NP, q = g % NP;
++                const int half = q / 2;
+                 const int l = it.get_local_id(1);
+-                float s0 = 0, s1 = 0, d0 = 0, d1 = 0;
+-                const float * c = cd + tk * nE;
+-                const float * m = md + tk * nE;
+-                for (int e = l; e < nE; e += WG) {
+-                    const float xc = c[e], xm = m[e];
+-                    float w0, w1;
+-                    if (d_bf16) {
+-                        w0 = bf16_to_f32(((const uint16_t *) wd)[(int64_t) rr * 2 * nE + e]);
+-                        w1 = bf16_to_f32(((const uint16_t *) wd)[(int64_t) rr * 2 * nE + nE + e]);
+-                    } else {
+-                        w0 = ((const float *) wd)[(int64_t) rr * 2 * nE + e];
+-                        w1 = ((const float *) wd)[(int64_t) rr * 2 * nE + nE + e];
+-                    }
+-                    s0 += xc * xc;
+-                    s1 += xm * xm;
+-                    d0 += w0 * xc;
+-                    d1 += w1 * xm;
++                const int e0 = (q % 2) * (nE / 2), e1 = (q % 2) ? nE : nE / 2;
++                const float * xv = (half ? md : cd) + tk * nE;
++                const int64_t wrow = (int64_t) rr * 2 * nE + (int64_t) half * nE;
++                float ss = 0, dd = 0;
++                for (int e = e0 + l; e < e1; e += WG) {
++                    const float xx = xv[e];
++                    const float w = d_bf16 ? bf16_to_f32(((const uint16_t *) wd)[wrow + e]) : ((const float *) wd)[wrow + e];
++                    ss += xx * xx;
++                    dd += w * xx;
+                 }
+                 auto sg = it.get_sub_group();
+-                s0 = sycl::reduce_over_group(sg, s0, sycl::plus<float>());
+-                s1 = sycl::reduce_over_group(sg, s1, sycl::plus<float>());
+-                d0 = sycl::reduce_over_group(sg, d0, sycl::plus<float>());
+-                d1 = sycl::reduce_over_group(sg, d1, sycl::plus<float>());
+-                const int si = l / SG;
++                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
++                dd = sycl::reduce_over_group(sg, dd, sycl::plus<float>());
+                 if (sg.leader()) {
+-                    red[si * 4 + 0] = s0;
+-                    red[si * 4 + 1] = s1;
+-                    red[si * 4 + 2] = d0;
+-                    red[si * 4 + 3] = d1;
++                    red[(l / SG) * 2 + 0] = ss;
++                    red[(l / SG) * 2 + 1] = dd;
+                 }
+                 sycl::group_barrier(it.get_group());
+-                if (l == 0) {
+-                    float a0 = 0, a1 = 0, b0 = 0, b1 = 0;
+-                    for (int s = 0; s < WG / SG; ++s) {
+-                        a0 += red[s * 4 + 0];
+-                        a1 += red[s * 4 + 1];
+-                        b0 += red[s * 4 + 2];
+-                        b1 += red[s * 4 + 3];
++                if (l < 2) {
++                    float t = 0;
++                    for (int s2 = 0; s2 < WG / SG; ++s2) {
++                        t += red[s2 * 2 + l];
+                     }
+-                    const float i0 = 1.0f / sycl::sqrt(a0 / (float) nE + eps);
+-                    const float i1 = 1.0f / sycl::sqrt(a1 / (float) nE + eps);
+-                    hd[tk * nRk + rr] = b0 * i0 + b1 * i1;
++                    hd[((tk * nRk + rr) * NP + q) * 2 + l] = t;
+                 }
+             });
+         });
+     }
+-    // kernel 2: one sub-group per (output channel, token)
++    // kernel 2: one sub-group per (output channel, token): h from the partials, then the gates
+     {
+         const int per = nRk / SG;
+         ctx.stream()->parallel_for(sycl::nd_range<1>(n_tok * n_embd * SG, SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+@@ -861,10 +946,14 @@ int fuse_control(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+             const int64_t tk = g / nE;
+             const int64_t e = g - tk * nE;
+             const int l = it.get_local_id(0);
++            const float * p0 = hd + (tk * nRk) * NP * 2;  // rank row 0: its sums of squares cover each half
++            const float i0 = 1.0f / sycl::sqrt((p0[0] + p0[2]) / (float) nE + eps);
++            const float i1 = 1.0f / sycl::sqrt((p0[4] + p0[6]) / (float) nE + eps);
+             float f = 0, gg = 0;
+             for (int k = 0; k < per; ++k) {
+                 const int j = l + k * SG;
+-                const float h = hd[tk * nRk + j];
++                const float * pj = hd + ((tk * nRk + j) * NP) * 2;
++                const float h = (pj[1] + pj[3]) * i0 + (pj[5] + pj[7]) * i1;
+                 float wfv, wgv;
+                 if (fg_bf16) {
+                     wfv = bf16_to_f32(((const uint16_t *) wf)[e * nRk + j]);
+@@ -943,8 +1032,202 @@ int fuse_conv(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+     return last - i;
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------
++// 8. relative-position mask for flash attention:
++//    MUL_MAT(pad(bias), R) MUL_MAT(W_sink, x) SUB CONT(permute) GET_ROWS(., rel_pos) CONT(permute) CPY(mask -> f32)
++//    ADD CPY(-> f16):  out[k, t, h] = f16(sum_j biaspad[j, rp[t*n_kv + k]] * R[j, h, t] - sink[h, t] + mask[k, t])
++int fuse_relmask(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
++    const ggml_tensor * mmT = cg->nodes[i];
++    if (mmT->op != GGML_OP_MUL_MAT || mmT->src[0]->op != GGML_OP_PAD) {
++        return 0;
++    }
++    int idx[9];
++    const int last = collect(cg, i, 9, idx);
++    if (last < 0) {
++        IFUSE_REJECT("relmask s2", mmT);
++    }
++    const ggml_tensor * mmS = cg->nodes[idx[1]], * sub = cg->nodes[idx[2]], * c1 = cg->nodes[idx[3]],
++                      * gr = cg->nodes[idx[4]], * c2 = cg->nodes[idx[5]], * mcp = cg->nodes[idx[6]],
++                      * add = cg->nodes[idx[7]], * out = cg->nodes[idx[8]];
++    if (mmS->op != GGML_OP_MUL_MAT || sub->op != GGML_OP_SUB || c1->op != GGML_OP_CONT || gr->op != GGML_OP_GET_ROWS ||
++        c2->op != GGML_OP_CONT || mcp->op != GGML_OP_CPY || add->op != GGML_OP_ADD || out->op != GGML_OP_CPY) {
++        IFUSE_REJECT("relmask s3", mmT);
++    }
++    const ggml_tensor * pad = mmT->src[0];   // [n_rel, n_extent + 1], zero last row
++    const ggml_tensor * bias = pad->src[0];  // [n_rel, n_extent]
++    const ggml_tensor * R = mmT->src[1];     // [n_rel, n_head, n_tok]
++    const ggml_tensor * Ws = mmS->src[0];    // [n_embd, n_head]
++    const ggml_tensor * xs = mmS->src[1];    // [n_embd, n_tok]
++    const ggml_tensor * rp = gr->src[1];     // I32 [n_kv * n_tok]
++    const ggml_tensor * mask = mcp->src[0];  // F16 [n_kv, n_tok(+pad)]
++    if (sub->src[0] != mmT || view_root(sub->src[1]) != mmS || view_root(c1->src[0]) != sub || gr->src[0] != c1 ||
++        view_root(c2->src[0]) != gr || add->src[0] != c2 || add->src[1] != mcp || out->src[0] != add) {
++        IFUSE_REJECT("relmask s4", mmT);
++    }
++    for (int k = 0; k < 9; ++k) {
++        if (ggml_get_op_params_i32(pad, k) != (k == 3 ? 1 : 0)) {
++            IFUSE_REJECT("relmask s5", mmT);  // only the one zero row after dim 1
++        }
++    }
++    const int64_t n_rel = bias->ne[0], n_ext1 = bias->ne[1], n_head = R->ne[1], n_tok = R->ne[2];
++    const int64_t n_embd = Ws->ne[0], n_kv = add->ne[0];
++    if (bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) || R->type != GGML_TYPE_F32 || !ggml_is_contiguous(R) ||
++        R->ne[0] != n_rel || n_rel > 64 || pad->ne[1] != n_ext1 + 1 || pad->ne[0] != n_rel || bias->ne[2] != 1 || (Ws->type != GGML_TYPE_BF16 && Ws->type != GGML_TYPE_F32) ||
++        !ggml_is_contiguous(Ws) || Ws->ne[1] != n_head || xs->type != GGML_TYPE_F32 || !ggml_is_contiguous(xs) ||
++        xs->ne[0] != n_embd || ggml_nrows(xs) != n_tok || n_embd % SG != 0 || rp->type != GGML_TYPE_I32 ||
++        !ggml_is_contiguous(rp) || ggml_nelements(rp) != n_kv * n_tok || mask->type != GGML_TYPE_F16 ||
++        mask->nb[0] != sizeof(ggml_fp16_t) || mask->ne[0] != n_kv || mask->ne[2] != 1 || mask->ne[3] != 1 ||
++        add->ne[1] != n_tok || add->ne[2] != n_head || add->ne[3] != 1 || out->type != GGML_TYPE_F16 ||
++        !ggml_is_contiguous(out) || !ggml_are_same_shape(out, add) || mcp->type != GGML_TYPE_F32 ||
++        gr->ne[0] != n_head || gr->ne[1] != n_kv * n_tok || c2->ne[0] != n_kv || c2->ne[1] != n_tok || c2->ne[2] != n_head) {
++        IFUSE_REJECT("relmask s6", mmT);
++    }
++    // R may be dead by then and share memory with out or the mask cast: the first kernel copies it to a temporary
++    if (overlaps(out, bias) || overlaps(out, xs) || overlaps(out, rp) || overlaps(out, mask)) {
++        if (ifuse_debug() >= 3) {
++            fprintf(stderr, "IFUSE relmask: ob %d ox %d orp %d om %d mb %d mx %d mrp %d mm %d mo %d mc %d shape %d %d %d / %lld %lld\n",
++                overlaps(out, bias), overlaps(out, xs), overlaps(out, rp), overlaps(out, mask), overlaps(mcp, bias),
++                overlaps(mcp, xs), overlaps(mcp, rp), overlaps(mcp, mask), overlaps(mcp, out), ggml_is_contiguous(mcp),
++                (int) mcp->ne[0], (int) mcp->ne[1], (int) mcp->ne[2], (long long) n_kv, (long long) mask->ne[1]);
++        }
++        IFUSE_REJECT("relmask overlap", out);
++    }
++    const ggml_tensor * outs[] = { out };
++    if (!span_ok(cg, i, last, outs, 1)) {
++        IFUSE_REJECT("relmask span", out);
++    }
++    ggml_sycl_pool_alloc<float> sink_alloc(ctx.pool(), n_head * n_tok);
++    float * sk = sink_alloc.get();
++    ggml_sycl_pool_alloc<float> r_alloc(ctx.pool(), n_rel * n_head * n_tok);
++    float * rc = r_alloc.get();
++    const float * Rsrc = (const float *) R->data;
++    const int nRelc = (int) n_rel;
++    const void * wd = Ws->data;
++    const bool w_bf16 = Ws->type == GGML_TYPE_BF16;
++    const float * xd = (const float *) xs->data;
++    const int nE = (int) n_embd, nH = (int) n_head;
++    constexpr int WGS = 256;
++    ctx.stream()->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<float, 1> part(WGS / SG, cgh);
++        cgh.parallel_for(sycl::nd_range<1>(n_tok * n_head * WGS, WGS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++            const int64_t g = it.get_group(0);
++            const int64_t tk = g / nH, h = g - tk * nH;
++            const int l = it.get_local_id(0);
++            float acc = 0.0f;
++            for (int e = l; e < nE; e += WGS) {
++                const float w = w_bf16 ? bf16_to_f32(((const uint16_t *) wd)[h * nE + e]) : ((const float *) wd)[h * nE + e];
++                acc += w * xd[tk * nE + e];
++            }
++            auto sg = it.get_sub_group();
++            acc = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
++            if (sg.leader()) {
++                part[l / SG] = acc;
++            }
++            sycl::group_barrier(it.get_group());
++            if (l == 0) {
++                float t = 0.0f;
++                for (int s2 = 0; s2 < WGS / SG; ++s2) {
++                    t += part[s2];
++                }
++                sk[tk * nH + h] = t;
++            }
++            if (l < nRelc) {
++                rc[(tk * nH + h) * nRelc + l] = Rsrc[(tk * nH + h) * nRelc + l];
++            }
++        });
++    });
++    const float * bd = (const float *) bias->data;
++    const float * Rd = rc;
++    const int32_t * rpd = (const int32_t *) rp->data;
++    const sycl::half * md = (const sycl::half *) mask->data;
++    const size_t m_nb1 = mask->nb[1] / sizeof(ggml_fp16_t);
++    sycl::half * od = (sycl::half *) out->data;
++    const int nRel = (int) n_rel;
++    const int64_t nKV = n_kv, nExt1 = n_ext1;
++    ctx.stream()->parallel_for(sycl::range<1>(n_kv * n_tok * n_head), [=](sycl::id<1> id) {
++        const int64_t k = id[0] % nKV;
++        const int64_t th = id[0] / nKV;
++        const int64_t tk = th % n_tok, h = th / n_tok;
++        const int32_t d = rpd[tk * nKV + k];
++        float v = 0.0f;
++        if (d >= 0 && d < nExt1) {  // d == n_extent is the zero padding row
++            const float * b = bd + (int64_t) d * nRel;
++            const float * r = Rd + (tk * nH + h) * nRel;
++            for (int j = 0; j < nRel; ++j) {
++                v += b[j] * r[j];
++            }
++        }
++        v = v - sk[tk * nH + h];
++        const float mv = (float) md[tk * m_nb1 + k];
++        v = v + mv;
++        od[id[0]] = (sycl::half) v;
++
++    });
++    return last - i;
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// 9. short-convolution input and state store: CONCAT(past, x^T, dim 0) CPY(last n_cols columns -> state cell)
++int fuse_convstore(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
++    const ggml_tensor * cat = cg->nodes[i];
++    if (cat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(cat, 0) != 0) {
++        return 0;
++    }
++    int idx[2];
++    const int last = collect(cg, i, 2, idx);
++    if (last < 0) {
++        return 0;
++    }
++    const ggml_tensor * cpy = cg->nodes[idx[1]];
++    if (cpy->op != GGML_OP_CPY || cpy->src[0]->op != GGML_OP_VIEW || cpy->src[0]->view_src != cat) {
++        return 0;
++    }
++    const ggml_tensor * past = cat->src[0];  // [n_cols, C, S] (strided view of the gathered state)
++    const ggml_tensor * xt = cat->src[1];    // [T, C, S] (transposed view of x [C, T])
++    const ggml_tensor * last_v = cpy->src[0];
++    const int64_t n_cols = past->ne[0], C = cat->ne[1], S = cat->ne[2], T = xt->ne[0];
++    if (cat->type != GGML_TYPE_F32 || past->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32 || !ggml_is_contiguous(cat) ||
++        cat->ne[0] != n_cols + T || past->ne[1] != C || xt->ne[1] != C || past->ne[2] != S || xt->ne[2] != S ||
++        cat->ne[3] != 1 || last_v->ne[0] != n_cols || last_v->ne[1] != C || last_v->ne[2] != S ||
++        last_v->view_offs != (size_t) T * sizeof(float) || last_v->nb[1] != cat->nb[1] || last_v->nb[2] != cat->nb[2] ||
++        cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(cpy) || ggml_nelements(cpy) != n_cols * C * S || n_cols > 8) {
++        return 0;
++    }
++    if (overlaps(cat, past) || overlaps(cat, xt) || overlaps(cpy, past) || overlaps(cpy, xt) || overlaps(cpy, cat)) {
++        IFUSE_REJECT("convstore overlap", cat);
++    }
++    const ggml_tensor * outs[] = { cat, cpy };
++    if (!span_ok(cg, i, last, outs, 2)) {
++        IFUSE_REJECT("convstore span", cat);
++    }
++    const char * pd = (const char *) past->data;
++    const size_t p0 = past->nb[0], p1 = past->nb[1], p2 = past->nb[2];
++    const char * xd = (const char *) xt->data;
++    const size_t x0 = xt->nb[0], x1 = xt->nb[1], x2 = xt->nb[2];
++    float * cd = (float *) cat->data;
++    float * sd = (float *) cpy->data;
++    const int64_t W = n_cols + T, nc = n_cols;
++    ctx.stream()->parallel_for(sycl::range<1>(W * C * S), [=](sycl::id<1> id) {
++        const int64_t j = id[0] % W;
++        const int64_t cs = id[0] / W;
++        const int64_t c = cs % C, sq = cs / C;
++        const float v = j < nc ? *(const float *) (pd + j * p0 + c * p1 + sq * p2)
++                               : *(const float *) (xd + (j - nc) * x0 + c * x1 + sq * x2);
++        cd[id[0]] = v;
++        if (j >= T) {
++            sd[(sq * C + c) * nc + (j - T)] = v;
++        }
++    });
++    return last - i;
++}
++
+ } // namespace
+ 
++static const char * g_ifuse_last = "";
++const char * ggml_sycl_inkling_fuse_last() { return g_ifuse_last; }
++
++#define IFUSE_TRY(bit, name, call) if ((m & (bit)) && (r = (call))) { g_ifuse_last = name; return r; }
++
+ int ggml_sycl_inkling_fuse(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+     const int m = ifuse_mask();
+     if (m == 0) {
+@@ -954,28 +1237,33 @@ int ggml_sycl_inkling_fuse(ggml_backend_sycl_context & ctx, const ggml_cgraph *
+     int r = 0;
+     switch (op) {
+         case GGML_OP_MUL:
+-            if ((m & 1) && (r = fuse_clip(ctx, cg, i))) return r;
+-            if ((m & 8) && (r = fuse_combine(ctx, cg, i))) return r;
++            IFUSE_TRY(1, "clip", fuse_clip(ctx, cg, i))
++            IFUSE_TRY(8, "combine", fuse_combine(ctx, cg, i))
+             break;
+         case GGML_OP_SQR:
+-            if ((m & 1) && (r = fuse_clip(ctx, cg, i))) return r;
++            IFUSE_TRY(1, "clip", fuse_clip(ctx, cg, i))
+             break;
+         case GGML_OP_UNARY:
+-            if ((m & 2) && ggml_get_unary_op(cg->nodes[i]) == GGML_UNARY_OP_SIGMOID && (r = fuse_router(ctx, cg, i))) return r;
++            if (ggml_get_unary_op(cg->nodes[i]) == GGML_UNARY_OP_SIGMOID) { IFUSE_TRY(2, "router", fuse_router(ctx, cg, i)) }
+             break;
+         case GGML_OP_REPEAT:
+-            if ((m & 4) && (r = fuse_situ(ctx, cg, i))) return r;
+-            if ((m & 8) && (r = fuse_combine(ctx, cg, i))) return r;
++            IFUSE_TRY(4, "situ", fuse_situ(ctx, cg, i))
++            IFUSE_TRY(8, "combine", fuse_combine(ctx, cg, i))
+             break;
+         case GGML_OP_SCALE:
+-            if ((m & 4) && (r = fuse_situ(ctx, cg, i))) return r;
++            IFUSE_TRY(4, "situ", fuse_situ(ctx, cg, i))
++            break;
++        case GGML_OP_MUL_MAT:
++            IFUSE_TRY(128, "relmask", fuse_relmask(ctx, cg, i))
++            IFUSE_TRY(2, "router", fuse_router_mm(ctx, cg, i))
+             break;
+         case GGML_OP_CONCAT:
+-            if ((m & 32) && (r = fuse_control(ctx, cg, i))) return r;
+-            if ((m & 16) && (r = fuse_mix(ctx, cg, i))) return r;
++            IFUSE_TRY(256, "convstore", fuse_convstore(ctx, cg, i))
++            IFUSE_TRY(32, "control", fuse_control(ctx, cg, i))
++            IFUSE_TRY(16, "mix", fuse_mix(ctx, cg, i))
+             break;
+         case GGML_OP_SSM_CONV:
+-            if ((m & 64) && (r = fuse_conv(ctx, cg, i))) return r;
++            IFUSE_TRY(64, "conv", fuse_conv(ctx, cg, i))
+             break;
+         default:
+             break;
+diff --git a/ggml/src/ggml-sycl/inkling-fuse.hpp b/ggml/src/ggml-sycl/inkling-fuse.hpp
+index 70d96f9..6bb1ecd 100644
+--- a/ggml/src/ggml-sycl/inkling-fuse.hpp
++++ b/ggml/src/ggml-sycl/inkling-fuse.hpp
+@@ -4,3 +4,6 @@
+ // Inkling 2 node-group fusions (inkling-fuse.cpp): returns the number of nodes after i the fused kernel covers
+ // (the caller skips them), or 0 when nothing matched at node i.
+ int ggml_sycl_inkling_fuse(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i);
++
++// name of the fusion the last non-zero ggml_sycl_inkling_fuse() call ran (profiling)
++const char * ggml_sycl_inkling_fuse_last();
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 2fac5d7..639b8ae 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -343,9 +343,14 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+                 ggml_tensor * m_attn = mix(bank, bank_last, q_attn);
+                 ggml_tensor * m_kv   = mix(bank, bank_last, q_kv);
+ 
++                // a single-token row view is already contiguous: copy only when it is not (same values either way)
++                auto row_view = [&](ggml_tensor * m, int64_t j) {
++                    ggml_tensor * v = ggml_view_2d(ctx0, m, n_embd, n_tokens, m->nb[2], j*m->nb[1]);
++                    return ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v);
++                };
+                 for (int j = 0; j < 2; ++j) {
+-                    messages[j == 0 ? 0 : 3] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_attn, n_embd, n_tokens, m_attn->nb[2], j*m_attn->nb[1]));
+-                    messages[j == 0 ? 1 : 2] = ggml_cont(ctx0, ggml_view_2d(ctx0, m_kv,   n_embd, n_tokens, m_kv->nb[2],   j*m_kv->nb[1]));
++                    messages[j == 0 ? 0 : 3] = row_view(m_attn, j);
++                    messages[j == 0 ? 1 : 2] = row_view(m_kv,   j);
+                 }
+             }
+         }
+@@ -369,7 +374,12 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+         if (layer.attn_res_query) {
+             ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
+             for (int j = 0; j < 3; ++j) {
+-                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
++                if (is_swa && j > 0) {
++                    inputs[j] = inputs[0];  // SWA layers mix one input for Q, K and V
++                    continue;
++                }
++                ggml_tensor * v = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]);
++                inputs[j] = ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v);
+             }
+         }
+ 
+-- 
+2.47.3
+

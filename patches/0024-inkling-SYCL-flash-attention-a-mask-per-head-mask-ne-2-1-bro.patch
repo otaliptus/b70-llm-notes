@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 04:04:04 +0000
+Subject: [PATCH] SYCL flash attention: a mask per head (mask->ne[2] > 1,
+ broadcast over head % ne[2])
+
+VEC and TILE offset the mask by nb32*(head % ne32); TILE runs one head per block for it (no GQA packing), the
+KV_max mask scan (head 0 only) is skipped, MKL / oneDNN / DPAS and quantized K/V keep rejecting it.
+Inkling 2 adds its relative-position bias to the mask, so FA ran on the CPU before. tests: 18 new
+FLASH_ATTN_EXT cases (8 KV heads x 3, mask_heads 24 and 8, kv 256..4096, nb 1/3/64) pass vs CPU.
+Inkling 2 Mini NVFP4-Q8_0 tg32 @ d32768: 27.3 (FA off) -> 32.2 (FA on); pp512 @ d32768 210 -> 177.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/fattn-common.hpp |  3 ++-
+ ggml/src/ggml-sycl/fattn-tile.hpp   |  6 ++++--
+ ggml/src/ggml-sycl/fattn-vec.hpp    |  4 +++-
+ ggml/src/ggml-sycl/fattn.cpp        | 19 +++++++++++++++----
+ tests/test-backend-ops.cpp          | 10 ++++++++++
+ 5 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/fattn-common.hpp b/ggml/src/ggml-sycl/fattn-common.hpp
+index c373263..8579ba1 100644
+--- a/ggml/src/ggml-sycl/fattn-common.hpp
++++ b/ggml/src/ggml-sycl/fattn-common.hpp
+@@ -1039,7 +1039,8 @@ void launch_fattn(
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths.
+-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
++    // the scan reads the first mask head only, so a mask per head (ne[2] > 1) skips it
++    if (mask && mask->ne[2] == 1 && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+         const int s31 = mask->nb[1] / sizeof(sycl::half2);
+         const int s33 = mask->nb[3] / sizeof(sycl::half2);
+ 
+diff --git a/ggml/src/ggml-sycl/fattn-tile.hpp b/ggml/src/ggml-sycl/fattn-tile.hpp
+index dcdcad8..0c19c28 100644
+--- a/ggml/src/ggml-sycl/fattn-tile.hpp
++++ b/ggml/src/ggml-sycl/fattn-tile.hpp
+@@ -731,7 +731,9 @@ static void flash_attn_tile(const char *  Q,
+     const sycl::half2 * V_h2 =
+         (const sycl::half2 *) (V + nb23 * sequence + nb22 * (head0 / gqa_ratio));  // K and V have same shape
+ 
+-    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33)) : nullptr;
++    // a mask per head (ne32 > 1) needs one head per block: the launcher picks ncols2 == 1 for it
++    const sycl::half * maskh = mask ? (const sycl::half *) (mask + nb33 * (sequence % ne33) +
++                                        (ncols2 == 1 && ne32 > 1 ? (int64_t) nb32 * (head0 % ne32) : 0)) : nullptr;
+ 
+     const int stride_K2   = nb11 / sizeof(sycl::half2);
+     const int stride_V2   = nb21 / sizeof(sycl::half2);
+@@ -1166,7 +1168,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_sycl_context & ctx, ggm
+     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+     //const bool nvidia = GGML_SYCL_CC_IS_NVIDIA(ggml_sycl_info().devices[ggml_sycl_get_device()].cc);
+     const int gqa_limit = gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    const bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     if constexpr (DV == 512) {
+         if (use_gqa_opt && gqa_ratio % 16 == 0) {
+diff --git a/ggml/src/ggml-sycl/fattn-vec.hpp b/ggml/src/ggml-sycl/fattn-vec.hpp
+index 5e40c88..1139645 100644
+--- a/ggml/src/ggml-sycl/fattn-vec.hpp
++++ b/ggml/src/ggml-sycl/fattn-vec.hpp
+@@ -125,7 +125,9 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
+ 
+-    const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0);
++    // a mask per head (ne32 > 1, Inkling 2 relative-position bias) is broadcast over head % ne32
++    const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0 +
++                                                     (ne32 > 1 ? (int64_t) nb32 * (head % ne32) : 0));
+ 
+     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+ 
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 525e6fd..eb6b67e 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -129,7 +129,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+     float logit_softcap = 0.0f;
+     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+ 
+-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    // a mask per head (mask->ne[2] > 1, broadcast over head % ne[2]) is read by VEC and by TILE with one head
++    // per block only: no GQA packing, no MKL / oneDNN / DPAS
++    const bool mask_per_head = mask && mask->ne[2] > 1;
++    if (mask_per_head && Q->ne[2] % mask->ne[2] != 0) {
++        return BEST_FATTN_KERNEL_NONE;
++    }
++    bool gqa_opt_applies = gqa_ratio >= 2 && mask && !mask_per_head && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
+     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
+@@ -157,7 +163,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+         V->ne[0] == 512 && gqa_ratio == 20 &&
+         K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+ 
+-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
++    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !mask_per_head && !sinks && gqa_ratio >= 2 &&
+         (standard_shape || glm_mla_shape) &&
+         Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
+         max_bias == 0.0f && logit_softcap == 0.0f &&
+@@ -242,8 +248,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
+             return BEST_FATTN_KERNEL_NONE;
+     }
+ 
+-    if (mask && mask->ne[2] != 1) {
+-        return BEST_FATTN_KERNEL_NONE;
++    if (mask_per_head) {
++        if (ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) {
++            return BEST_FATTN_KERNEL_NONE;  // the quantized VEC / DPAS paths are not checked with a mask per head
++        }
++        const bool vec_ok = Q->ne[1] == 1 && Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
++                            K->type != GGML_TYPE_BF16 && V->type != GGML_TYPE_BF16;
++        return vec_ok ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_TILE;
+     }
+ 
+     // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1c22ffa..549bb64 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13641,6 +13641,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1,   1, 17024, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 1, 512, 32768, 1024, 1, GGML_TYPE_F16, GGML_TYPE_F32));
+ 
++    // a mask per Q head (Inkling 2 relative-position bias added to the mask): 8 KV heads, 3 Q heads each
++    for (int64_t mh : { 24, 8 }) {
++        for (int64_t kv : { 256, 1024, 4096 }) {
++            for (int64_t nb : { 1, 3, 64 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,
++                    GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
++            }
++        }
++    }
++
+     // mask broadcast over Q heads and batches
+     for (bool sinks : { false, true }) {
+         for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+-- 
+2.47.3
+

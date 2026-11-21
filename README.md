@@ -4,7 +4,7 @@ Working notes from two weeks of running 20-80B open-weight models on a single In
 llama.cpp (SYCL and Vulkan backends) and Strata, plus the small benchmark harness used to compare them. Everything
 here is generic: no personal paths, keys or hostnames; scripts take their locations from environment variables.
 
-## Six results worth knowing
+## Seven results worth knowing
 1. **A hard thinking budget (~2048 tokens) beats unlimited thinking** for every Qwen-family reasoning model tried:
    higher score *and* 2-4x less wall time, because unlimited runs regularly think to the output limit and never
    answer. [`docs/04-thinking-budget.md`](docs/04-thinking-budget.md). Measured on Strata 0.1.44 and llama.cpp;
@@ -40,6 +40,13 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    Battlemage FA vector-kernel PR and the official DFlash2 block drafter together: another +20 % on the full suite
    (78 vs 65 tok/s median, 11 % less wall, same long-context pass rate, +59 % decode at 64k depth). Served Orca went
    from 50 to 78 tok/s in one day. [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md)
+7. **Inkling 2 Mini on SYCL: 28 -> 58 tok/s from kernels, not settings.** The NVFP4 expert mat-vec was compute-bound
+   (emulated FP4 table plus `pow` for every scale); decoding with SWAR and building the scale from its bits made it 3.3x
+   faster. The SYCL flash-attention kernels learned a per-head mask (the model's relative-position bias), and nine
+   model-specific node-group fusions cut decode launches from 7,609 to ~2,250. Server decode 28.4 -> 57.7 tok/s, pp512
+   343 -> 889, 103k-token prompt prefill 142 -> 265 and decode at that depth 14.1 -> 37.7, KLD unchanged within noise.
+   Also found: the unfused relative-position path breaks past ~2^29 elements (~87k tokens at micro-batch 256).
+   [`docs/13-inkling-2-mini.md`](docs/13-inkling-2-mini.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 
@@ -58,9 +65,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
 | [`docs/10-sycl-speculative-kquant.md`](docs/10-sycl-speculative-kquant.md) | llama.cpp SYCL: where a speculative step goes, probabilistic MTP drafting, faster multi-column K-quant mat-vecs, full-suite validation, the oneDNN build trap; 36 -> 48 tok/s served |
 | [`docs/11-agent-context-management.md`](docs/11-agent-context-management.md) | keeping a local agent fast over long sessions: compaction point, durable notes, tool logs on disk, stable prefixes, per-request thinking budgets, what to count |
 | [`docs/12-sycl-xmx-upstream-pass.md`](docs/12-sycl-xmx-upstream-pass.md) | upstream pass 2026-10-18/19: llama.cpp PR #29864 XMX multi-column mat-vecs (+30 % full-suite tok/s over part 2, per-kernel table, flat verify cost), Strata 0.1.45 and KREG A/Bs, draft length revisited, and the backlog items that did not apply |
+| [`docs/13-inkling-2-mini.md`](docs/13-inkling-2-mini.md) | Inkling 2 Mini (looped MoE, NVFP4 experts) on SYCL: NVFP4-Q8_0 requant, NVFP4 mat-vec decode fix, per-head flash-attention mask, Inkling node-group fusions, the long-context overflow, where the time goes; 28 -> 58 tok/s served |
 | [`bench/`](bench/) | the harness (stdlib Python + Docker sandbox) and the generated [`report.md`](bench/results/report.md) |
 | [`scripts/`](scripts/) | serve / build / sweep / profile / requant / perplexity scripts |
-| [`patches/`](patches/) | llama.cpp patches (0001-0010) and Strata patches (0011-0018: in-file MTP head packer, Intel drafter path check, Intel server hook (0.2.10 only), SYCL DFlash2 planar Q6_K head gather, drafter check on the engine binary, launcher zero allowance, A/B drafter arm, tuned-DFlash2 test switch; 0011-0012 and 0014-0018 against v0.2.15). b11669: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes. b11696: SYCL K-quant multi-column mat-vecs (0008), MTP draft timing (0009), Qwen3.5-class perf shapes (0010). On PR #29864 / master b11721 apply 0009-0010 only (0008 is superseded there, see 12) |
+| [`patches/`](patches/) | llama.cpp patches (0001-0010) and Strata patches (0011-0018: in-file MTP head packer, Intel drafter path check, Intel server hook (0.2.10 only), SYCL DFlash2 planar Q6_K head gather, drafter check on the engine binary, launcher zero allowance, A/B drafter arm, tuned-DFlash2 test switch; 0011-0012 and 0014-0018 against v0.2.15). b11669: SYCL `out_prod` strided f32 fix (DFlash on SYCL); Vulkan: IQ2_XXS/NVFP4 integer-dot paths, dedicated NVFP4 mat-vec, top-k router fix, Intel policy + knobs, perf shapes. b11696: SYCL K-quant multi-column mat-vecs (0008), MTP draft timing (0009), Qwen3.5-class perf shapes (0010). On PR #29864 / master b11721 apply 0009-0010 only (0008 is superseded there, see 12). 0019-0029: Inkling 2 Mini on Unsloth's b12572-mix (SCALE strided source, get_rows launch split, NVFP4 SWAR decode, per-node GPU profiler, per-head FA mask, `inkling-fuse.cpp` fusions; see 13) |
 
 ## Quick start
 ```sh
@@ -74,7 +82,8 @@ python3 bench/report.py                               # bench/results/report.md
 ```
 Models used: Qwen3.8 Flash-Next and Swift 1.5 (IQ3_S, Strata), OrcaSAQ-2-Cyber-27B (Q4_K_S), LiquidAI
 LFM2.5-24B-A2B (Q6_K), NVIDIA Nemotron 3.5 Bolt 74B-A9B (IQ2_XXS + DFlash drafter). llama.cpp releases b11541,
-b11669, b11696 and PR #29864 on b11721; Strata 0.1.44.1 and 0.1.45. Dates 2026-10-10 to 2026-10-19.
+b11669, b11696 and PR #29864 on b11721; Strata 0.1.44.1 and 0.1.45. Dates 2026-10-10 to 2026-10-19. Later: Strata
+0.2.x (2026-11), Thinking Machines Inkling 2 Mini (NVFP4 experts + Q8_0, Unsloth llama.cpp b12572-mix, 2026-11-20/21).
 
 ## License
 MIT, see [`LICENSE`](LICENSE).
