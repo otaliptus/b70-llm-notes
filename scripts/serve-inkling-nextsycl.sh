@@ -5,6 +5,7 @@ if [[ ${1:-} == --help ]]; then
     echo 'Set RUNTIME, MODELS and API_KEY_FILE, then run serve-inkling-nextsycl.sh.'
     echo 'RUNTIME is a directory containing nextsycl, libnextsycl-llm.so and silo/libnextsycl-inkling2.so.'
     echo 'INKLING_NATIVE_PORT defaults to 18081. CTX defaults to 131072. SYCL_IMAGE selects the oneAPI runtime image.'
+    echo 'PROMPT_CACHE_MIB sets the host checkpoint cache budget in MiB and defaults to 6144.'
     exit 0
 fi
 [[ $# == 0 ]] || { echo 'See --help for usage.' >&2; exit 2; }
@@ -31,5 +32,5 @@ exec docker run --rm --init --name "inkling-unc-native-$port" --stop-timeout 10 
     --entrypoint bash "${SYCL_IMAGE:-strata-sycl-dev}" -lc '
         source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1
         exec /runtime/nextsycl serve /models/inkling.gguf --gpu 0 --name inkling-2-mini \
-            --ctx "$1" --parallel 1 --host 0.0.0.0 --port 18081 --effort low
-    ' -- "$context"
+            --ctx "$1" --prompt-cache-mib "$2" --parallel 1 --host 0.0.0.0 --port 18081 --effort low
+    ' -- "$context" "${PROMPT_CACHE_MIB:-6144}"

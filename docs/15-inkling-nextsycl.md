@@ -14,6 +14,10 @@ The patch tiles full-attention prompt reads and groups several decode queries so
 
 At each of 192 continuation positions, the runtime exported all 200,058 target logits. Five runs covered prompt lengths of roughly 7.3K, 40K and 100K tokens, with forward passes of one, four or seven rows. Each complete output file matched its control byte for byte. The three distinct text fixtures cover a narrower range of content than the five executions. The model, quantization, sampling distribution, draft head and configured context were the same throughout. Apply 0056 after 0055 and rebuild the executable and the Inkling silo. [Output hashes](../bench/results/inkling-native-long-logits.csv) · [Runtime patch](../patches/0056-nextsycl-inkling-long-attention.patch)
 
+## Follow-ups near the 131K launch limit
+
+At 126,458 input tokens, patch 0056 generated **47.6 tok/s** on a cold source-reading request. The default launcher now allows 6 GiB of host RAM for prompt checkpoints. The 4 GiB setting could retain only a shorter checkpoint. Its two follow-ups reread over 56,000 tokens each. With 6 GiB the same turns read 262 and 158 fresh tokens, and time to first token fell from **47.25 to 1.19 seconds** and **52.12 to 1.14 seconds**. Decode on the two follow-ups measured 51.8 and 41.6 tok/s. The cold answer and first follow-up matched exactly. The last prompt contained the same tokens but produced two differently worded checklists (620 and 503 generated tokens). The 4 GiB run reconstructed more of its state by prefill. Both runs used the same weights, GPU context allocation and seed. Set `PROMPT_CACHE_MIB` to choose the host memory budget. [Per-turn measurements and output hashes](../bench/results/inkling-native-near-context-limit.csv)
+
 ## Workloads and compaction with patch 0056
 
 | Workload | Requests | Fresh prefill tok/s | Decode tok/s | Original decode tok/s |
