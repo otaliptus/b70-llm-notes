@@ -1,0 +1,252 @@
+diff --git a/kernels/llm/inkling2/silo/mv.cpp b/kernels/llm/inkling2/silo/mv.cpp
+index 603caae4cdf336aa70bdcbc5055e3dc873c3c773..6e13639055ecd9e4320307ff7d32c54856356735 100644
+--- a/kernels/llm/inkling2/silo/mv.cpp
++++ b/kernels/llm/inkling2/silo/mv.cpp
+@@ -9,6 +9,8 @@
+ #include "ns.h"
+ #include "ns_internal.hpp"
+ #include "silo.h"
++#include "q8_head.hpp"
++#include "b70.hpp"
+ 
+ #include <sycl/sycl.hpp>
+ #include <dpct/dpct.hpp>
+@@ -564,6 +566,15 @@ int ns_ink2s_mv_many(ns_gpu* g, int n, const int* ty, const void* const* w, cons
+                      const int64_t* n_in, int64_t T) {
+     NS_TRY
+     if (n < 1 || n > 8 || T < 1 || T > MAXT) return ns_fail("ns_ink2s_mv_many: 1..8 products, 1..16 rows");
++    // Keep the existing grouped launch for small matrices and unrelated model geometries.
++    if (n == 1 && ty[0] == 8 && n_in[0] == 2304 && rows[0] >= 8192 &&
++        rows[0] <= 1048576 && rows[0] % 16 == 0 && T <= 8 && ink_b70::supported(g->dev)) {
++        const int r = static_cast<int>(rows[0]), c = static_cast<int>(n_in[0]);
++        if (T == 1) q8_head::submit<1>(g->q, w[0], xq[0], y[0], T, r, c);
++        else if (T == 2) q8_head::submit<2>(g->q, w[0], xq[0], y[0], T, r, c);
++        else q8_head::submit<4>(g->q, w[0], xq[0], y[0], T, r, c);
++        return 0;
++    }
+     // the jobs of one type a launch (the launches in order); a launch of few rows takes a row a sub-group
+     for (int i = 0; i < n;) {
+         const int t0 = ty[i];
+diff --git a/kernels/llm/inkling2/silo/q8_head.hpp b/kernels/llm/inkling2/silo/q8_head.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..77479ef48cb29f527fa8c8fdfe4599a039a571cf
+--- /dev/null
++++ b/kernels/llm/inkling2/silo/q8_head.hpp
+@@ -0,0 +1,80 @@
++// Dense Q8_0 output heads on Xe2. Each eight-lane work-group computes sixteen vocabulary rows.
++// DPAS evaluates two 16-value dot products per activation block, using a zero half in each
++// operand row. Keeping those half-blocks separate preserves the accumulation tree of mv_t.
++#pragma once
++
++#include <sycl/ext/intel/esimd.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++namespace q8_head {
++namespace es = sycl::ext::intel::esimd;
++namespace xmx = es::xmx;
++
++template<int Batch>
++void submit(sycl::queue& queue, const void* weight, const void* input, float* output,
++            int tokens, int rows, int columns) {
++    constexpr int N = 16, workers = 8, halves = 2 * Batch;
++    const int blocks = columns / 32, token_tiles = (tokens + Batch - 1) / Batch;
++    const auto* quants = static_cast<const uint32_t*>(weight);
++    const auto* scales = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(weight) +
++                                                            ns_ink2s_scales_at(8, rows, columns));
++    const auto* acts = static_cast<const int*>(input);
++    const auto* act_scales = reinterpret_cast<const float*>(static_cast<const uint8_t*>(input) +
++                                                            ns_ink2s_xq_scales_at(tokens, columns));
++    auto properties = sycl::ext::oneapi::experimental::properties{
++        sycl::ext::intel::experimental::grf_size<256>};
++    const size_t groups = size_t(rows / N) * token_tiles;
++    queue.parallel_for(sycl::nd_range<1>(groups * workers, workers), properties,
++                       [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++        es::slm_init<workers * halves * N * sizeof(float)>();
++        const int group = it.get_group_linear_id(), tile = group / token_tiles;
++        const int first_token = (group % token_tiles) * Batch, lane = it.get_local_id(0);
++        es::simd<float, halves * N> accum(0.0f);
++        for (int block = lane; block < blocks; block += workers) {
++            es::simd<int, 8 * N> rhs = es::load_2d<uint32_t, 8, N, 1, true>(
++                quants + size_t(tile) * N * columns / 4, columns - 1, N - 1, columns - 1,
++                8 * block, 0);
++            es::simd<uint32_t, N> offsets(block * 2, blocks * 2);
++            auto bits = es::gather<uint16_t, N>(scales + size_t(tile) * N * blocks, offsets);
++            es::simd<float, N> w_scale = es::simd<sycl::half, N>(bits.template bit_cast_view<sycl::half>());
++            es::simd<int, halves * 8> lhs(0);
++            float x_scale[Batch];
++#pragma unroll
++            for (int j = 0; j < Batch; ++j) {
++                const int token = first_token + j < tokens ? first_token + j : tokens - 1;
++                const size_t index = size_t(token) * blocks + block;
++                auto bytes = es::block_load<int, 8>(acts + index * 8);
++                lhs.template select<4, 1>(j * 16) = bytes.template select<4, 1>(0);
++                lhs.template select<4, 1>(j * 16 + 12) = bytes.template select<4, 1>(4);
++                x_scale[j] = act_scales[index];
++            }
++            auto products = xmx::dpas<8, halves, int, int, int, int,
++                xmx::dpas_argument_type::s8, xmx::dpas_argument_type::s8>(
++                    es::simd<int, halves * N>(0), rhs, lhs);
++#pragma unroll
++            for (int h = 0; h < halves; ++h) {
++                es::simd<float, N> dot = es::simd<int, N>(products.template select<N, 1>(h * N));
++                es::simd<float, N> scale = w_scale * x_scale[h / 2];
++                es::simd<float, N> old = accum.template select<N, 1>(h * N);
++                accum.template select<N, 1>(h * N) =
++                    es::simd<float, N>(__builtin_elementwise_fma(dot.data(), scale.data(), old.data()));
++            }
++        }
++        es::slm_block_store<float, halves * N>(lane * halves * N * sizeof(float), accum);
++        es::barrier();
++        if (lane < Batch && first_token + lane < tokens) {
++            es::simd<float, N> partial[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i)
++                partial[i] = es::slm_block_load<float, N>(
++                    ((i / 2 * halves + lane * 2 + i % 2) * N) * sizeof(float));
++#pragma unroll
++            for (int stride = 8; stride; stride >>= 1)
++#pragma unroll
++                for (int i = 0; i < stride; ++i) partial[i] += partial[i + stride];
++            es::block_store<float, N>(output + size_t(first_token + lane) * rows + tile * N, partial[0]);
++        }
++    });
++}
++
++} // namespace q8_head
+diff --git a/llm/inkling2/src/engine/dspark.rs b/llm/inkling2/src/engine/dspark.rs
+index cb1ea502ba8c1735c4a0c0c35f9ceb229894374f..41cb423ab71b736870184755b0f67d2fcb220371 100644
+--- a/llm/inkling2/src/engine/dspark.rs
++++ b/llm/inkling2/src/engine/dspark.rs
+@@ -37,6 +37,8 @@ pub struct DLayer {
+ }
+ 
+ pub struct DSpark {
++    /// Maximum preceding tokens in the proposal network's full-attention pass; zero keeps the whole prefix.
++    proposal_window: usize,
+     layers: Vec<DLayer>,
+     /// softmax(dspark_fuse) rows: a layer's context mix each, the last f_rnn's
+     alpha: Vec<DevBuf>,
+@@ -284,10 +286,21 @@ pub fn load(d: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, k: &ffi::Api, s: &'static ff
+     arena.rewind(mark);
+     let fold = Mat { buf: fold_buf, ty: GType::BF16, rows: vp, cols: rank, packed: false };
+     let bytes = loaded.get() + w1raw.len() as u64 + (vp * rank * 2 + vp * 4) as u64;
+-    Ok(DSpark { layers, alpha, norm: read("output_norm.weight")?.buf, frnn_norm: read("dspark_norm.weight")?.buf, mask_rows, w1, joint, joint_b, head, full_ids, fold, fold_b,
++    let proposal_window = std::env::var("NS_INK2_DRAFT_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
++    Ok(DSpark { proposal_window, layers, alpha, norm: read("output_norm.weight")?.buf, frnn_norm: read("dspark_norm.weight")?.buf, mask_rows, w1, joint, joint_b, head, full_ids, fold, fold_b,
+                 taps: taps[..FEATS - 1].to_vec(), rank, heads, heads_kv, ff, theta, eps, block, bytes })
+ }
+ 
++/// A full-attention proposal layer still uses absolute rotary positions. Align the
++/// first visible position to its 64-key attention split. Target layers use their full context.
++fn proposal_from(window: usize, layer_window: usize, pos: usize) -> usize {
++    if layer_window == 0 && window > 0 && pos >= 32768 {
++        pos.saturating_sub(window) / 64 * 64
++    } else {
++        0
++    }
++}
++
+ impl DSpark {
+     /// The buffers a checkpoint keeps for the drafter: each layer's keys and values, then f_rnn
+     pub fn save_bufs(&self) -> usize {
+@@ -296,11 +309,15 @@ impl DSpark {
+ }
+ 
+ impl Inkling2<'_> {
++    pub(crate) fn proposal_window(&self) -> usize {
++        self.ds.as_ref().map_or(0, |d| d.proposal_window)
++    }
++
+     /// One session's drafter state into another's (positions the drafter still reads up to `pos`; f_rnn's rows)
+     pub(super) fn ds_copy(&self, dst: &mut DsState, src: &DsState, pos: usize, _last_rows: usize) -> Result<()> {
+         let Some(d) = &self.ds else { return Ok(()) };
+         for (dl, ((dk, dv, dc), (sk, sv, sc))) in d.layers.iter().zip(dst.caches.iter().zip(&src.caches)) {
+-            let from = Self::kept(dl.win, pos);
++            let from = Self::kept(dl.win, pos).max(proposal_from(d.proposal_window, dl.win, pos));
+             self.copy_ring(dk, *dc, sk, *sc, d.heads_kv, from, pos)?;
+             self.copy_ring(dv, *dc, sv, *sc, d.heads_kv, from, pos)?;
+         }
+@@ -316,7 +333,7 @@ impl Inkling2<'_> {
+         let row = self.g.head * 2;
+         let mut bufs = Vec::new();
+         for (dl, (kc, vc, cp)) in d.layers.iter().zip(&st.caches) {
+-            let from = Self::kept(dl.win, pos);
++            let from = Self::kept(dl.win, pos).max(proposal_from(d.proposal_window, dl.win, pos));
+             for c in [kc, vc] {
+                 let old = previous.and_then(|v| v.get(bufs.len()));
+                 bufs.push(save_ring(c, *cp, d.heads_kv, row, from, pos, old)?);
+@@ -335,7 +352,7 @@ impl Inkling2<'_> {
+         let row = self.g.head * 2;
+         let mut it = bufs.iter();
+         for (dl, (kc, vc, cp)) in d.layers.iter().zip(&st.caches) {
+-            let from = Self::kept(dl.win, pos);
++            let from = Self::kept(dl.win, pos).max(proposal_from(d.proposal_window, dl.win, pos));
+             for c in [kc, vc] {
+                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+                 restore_ring(c, *cp, d.heads_kv, row, from, pos, b, dirty_end.map_or(pos, |high| high.saturating_sub(*cp).clamp(from, pos)))?;
+@@ -434,8 +451,12 @@ impl Inkling2<'_> {
+             let hq = xq_of(&dl.attn_norm)?;
+             let [q, kx, vx]: [DevBuf; 3] = self.mm_many(&[(&dl.q, &x, Some(&hq)), (&dl.k, &x, Some(&hq)), (&dl.v, &x, Some(&hq))], rows)?
+                 .try_into().map_err(|_| e("three products"))?;
+-            // SAFETY: arithmetic only.
+-            let ns = unsafe { (sl.fused.attn_splits)(rows as i64, p0 as i64, dl.win as i64) } as usize;
++            // Full K/V stores time contiguously within each head. The view's original
++            // head stride covers all absolute positions written by this session.
++            let skip = proposal_from(d.proposal_window, dl.win, p0);
++            let attention_pos = (p0 - skip) as i64;
++            let byte_offset = skip * g.head * std::mem::size_of::<u16>();
++            let ns = unsafe { (sl.fused.attn_splits)(rows as i64, attention_pos, dl.win as i64) } as usize;
+             let part = self.f32(rows * d.heads * ns * (g.head + 2))?;
+             let att = self.f32(rows * qd)?;
+             // SAFETY: arithmetic only.
+@@ -446,8 +467,9 @@ impl Inkling2<'_> {
+                 self.op("draft k norm rope", || (dk.qk_norm_rope)(self.raw(), kx.fp(), rows as i64, d.heads_kv as i64, dl.k_norm.fp(), d.eps, d.theta, p0 as i64))?;
+                 self.op("draft kv store", || (self.k.kv_store)(self.raw(), kx.fp(), vx.fp(), rows as i64, d.heads_kv as i64, g.head as i64, *cp as i64, p0 as i64,
+                                                                kc.ptr(), vc.ptr()))?;
+-                self.op("draft attention", || (dk.attn_part_block)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), part.fp(), rows as i64, d.heads as i64, d.heads_kv as i64,
+-                                                                    *cp as i64, p0 as i64, dl.win as i64, 1.0 / (g.head as f32).sqrt()))?;
++                self.op("draft attention", || (dk.attn_part_block)(self.raw(), q.fp(), kc.ptr().byte_add(byte_offset),
++                                                                    vc.ptr().byte_add(byte_offset), part.fp(), rows as i64, d.heads as i64, d.heads_kv as i64,
++                                                                    *cp as i64, attention_pos, dl.win as i64, 1.0 / (g.head as f32).sqrt()))?;
+             }
+             self.merge_attention("draft merge", &sl.fused, &part, None, None, &att, &aq, rows, d.heads, ns)?;
+             let _ = kd;
+@@ -521,3 +543,20 @@ impl Inkling2<'_> {
+         Ok(b.chunks_exact(4).skip(1).take(sure).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+     }
+ }
++
++
++#[cfg(test)]
++mod proposal_window_tests {
++    use super::proposal_from;
++
++    #[test]
++    fn only_long_full_proposal_layers_omit_whole_splits() {
++        assert_eq!(proposal_from(2048, 0, 32767), 0);
++        assert_eq!(proposal_from(2048, 0, 32768), 30720);
++        assert_eq!(proposal_from(2048, 0, 32831), 30720);
++        assert_eq!(proposal_from(2048, 0, 32832), 30784);
++        assert_eq!(proposal_from(65536, 0, 32768), 0);
++        assert_eq!(proposal_from(2048, 1024, 99978), 0);
++        assert_eq!(proposal_from(0, 0, 99978), 0);
++    }
++}
+diff --git a/llm/inkling2/src/lib.rs b/llm/inkling2/src/lib.rs
+index 3a5a96cbf0a462d5a080f4e64605b6f0eca5cc00..f42ece7a5b7b632d204e6d5f9e148df053adebb1 100644
+--- a/llm/inkling2/src/lib.rs
++++ b/llm/inkling2/src/lib.rs
+@@ -118,7 +118,12 @@ impl Engine for engine::Inkling2<'_> {
+         let chunk = self.prefill_chunk();
+         let draft = if self.has_draft() { " dspark" } else { "" };
+         let grouping = if chunk > engine::PROMPT_GEMM_ROWS { " gemm2048-v1" } else { "" };
+-        format!("inkling2 f16-kv conv-state nsink-1 chunk={chunk}{draft}{grouping}")
++        let mut key = format!("inkling2 f16-kv conv-state nsink-1 chunk={chunk}{draft}{grouping}");
++        let window = self.proposal_window();
++        if window > 0 {
++            key.push_str(&format!(" draft-window={window}"));
++        }
++        key
+     }
+     fn session(&self, max_ctx: usize) -> Result<Session> {
+         Ok(Session::new(engine::Inkling2::session(self, max_ctx)?))
