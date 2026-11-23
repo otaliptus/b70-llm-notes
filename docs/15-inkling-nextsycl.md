@@ -6,6 +6,15 @@ The twelve recurrent layers use the same two source tensors during each return t
 
 In the six everyday tasks, the recurrent-projection build averaged **102.97 decode tok/s**, compared with 99.64 on 0056. The two source-reading requests went from 79.13 to **81.28**, and the fourteen-turn conversation went from 78.83 to **81.63**. All 22 visible answers, generated lengths and draft acceptance counts matched. This build included the batched convolution rollback. The final 0058 patch also writes the target output projection directly into its destination and reads draft IDs and probabilities in one transfer. Its 153,644,544 scored target logits matched the 0054 control across four runs at 7.3K, 40K and 100K. Apply 0058 after 0057 and rebuild the executable and Inkling silo. [Workload counters](../bench/results/inkling-native-workloads.csv) · [Logit hashes](../bench/results/inkling-native-long-logits.csv) · [Runtime patch](../patches/0058-nextsycl-inkling-recurrent-projections.patch)
 
+The installed 0058 executable and silo were then tested together. All 28 fixed-seed visible answers and generated lengths matched 0056. The six everyday tasks and both source-reading tasks passed their checks. Each twice-compacted handoff retained all five fields. The first exercise produced summaries of 29 and 33 words, the second 34 and 42. [Per-request measurements](../bench/results/inkling-native-workloads.csv)
+
+| Installed 0058 workload | Requests | Fresh prompt tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| Everyday tasks | 6 | 1,720.07 | 103.34 |
+| Continuous conversation | 14 | 330.29 | 81.90 |
+| 40K source and follow-up | 2 | 1,764.53 | 81.33 |
+| Two 98K compaction exercises | 6 | 1,677.04 | 65.86 |
+
 ## Long-context performance with patch 0056
 
 One B70 generated the same 1,254 tokens at **52.31 tok/s** across a three-turn source-reading conversation. The original runtime averaged **23.20 tok/s**. The cold request read 99,978 tokens at **1,543 tok/s**, up from **1,023 tok/s**. All three answers, generation lengths and draft acceptance counts matched at fixed seeds. [Per-turn counters and answer hashes](../bench/results/inkling-native-long-attention.csv)
@@ -77,6 +86,12 @@ The AtomicChat Inkling-2-Mini-Uncensored AD-Q4_K checkpoint reached 104.2 genera
 | Second follow-up, 100,226 tokens reused | 1 | 37 | 22.1 | 4.01 s |
 
 Rates use total fresh prompt or generated tokens divided by the corresponding native runtime seconds. Generation includes reasoning. The full 39-task suite produced 54,037 tokens and scored 34/39, matching the previous DSpark-on llama.cpp run's score. The suite is stochastic. The first *visible answer* took 2.73 seconds median in chat. The 100K requests generated 1,254 tokens in 54.25 seconds. [Per-request counters](../bench/results/inkling-native-b70.csv)
+
+## Other single-B70 results as of November 23, 2026
+
+Strata's 0.2.19 release lists **159.2 decode tok/s** on one 32 GB B70. Its B70 figure has no associated prompt length or per-request trace in the release notes. A B70 owner running the released binary reported 25.2–29.5 tok/s with drafting off and 10.8–12.0 with DSpark on a 300-token prose task configured for 32K context. These measurements use a different engine and checkpoint pack. [Strata release](https://github.com/Niko1221/Strata/releases/tag/v0.2.19) · [User's hardware, commands and timings](https://github.com/Niko1221/Strata/issues/6595#issuecomment-7089002127)
+
+OpenDynalmx published a context sweep on a single 32 GB B70 using a vLLM XPU fork, the original Inkling Mini NVFP4/MXFP8 weights and no speculative decoding. Sustained single-request decode measured 68.3 tok/s near empty, 53.4 at 64K, 43.8 at 128K and 34.5 at 224K. At 128K the run measured 1,562 prompt tok/s. Each decode measurement lasted 30 seconds after cache warm-up. Our 126,458-token source and follow-ups use AtomicChat AD-Q4_K and DSpark, so prompts, weights and measurement windows differ. [Submitted run and full matrix](https://www.localmaxxing.com/en/inference-benchmarks/cmwsroyel007bld01mkdlnopk)
 
 ## Reproduce the runtime
 
