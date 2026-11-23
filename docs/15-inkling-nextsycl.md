@@ -14,6 +14,18 @@ The patch tiles full-attention prompt reads and groups several decode queries so
 
 At each of 192 continuation positions, the runtime exported all 200,058 target logits. Five runs covered prompt lengths of roughly 7.3K, 40K and 100K tokens, with forward passes of one, four or seven rows. Each complete output file matched its control byte for byte. The three distinct text fixtures cover a narrower range of content than the five executions. The model, quantization, sampling distribution, draft head and configured context were the same throughout. Apply 0056 after 0055 and rebuild the executable and the Inkling silo. [Output hashes](../bench/results/inkling-native-long-logits.csv) · [Runtime patch](../patches/0056-nextsycl-inkling-long-attention.patch)
 
+## Workloads and compaction with patch 0056
+
+| Workload | Requests | Fresh prefill tok/s | Decode tok/s | Original decode tok/s |
+|---|---:|---:|---:|---:|
+| User's graded suite | 39 | 525.21 | 102.19 | 104.17 |
+| Everyday tasks | 6 | 1,712.05 | 99.64 | 94.56 |
+| Continuous conversation | 14 | 330.71 | 78.83 | 78.87 |
+| Source handoff and follow-up at 40K | 2 | 1,763.21 | 79.13 | 45.08 |
+| Two 98K compaction exercises | 6 | 1,653.50 | 64.69 | 29.57 |
+
+Rates divide total tokens by the corresponding total engine time. Decode includes reasoning and visible output. The unmodified graded suite drew 57,870 tokens and passed 35 of 39, compared with 54,037 tokens and 34 of 39 in the original run. It samples different answers between runs. The other four workloads used fixed seeds. All 28 visible answers and generated lengths matched the original runtime. All six everyday tasks and both source handoff tasks passed their checks. Each compaction exercise generated two summaries and answered a question after a context reset. Both retained all five requested facts, including the current bay, booking and owner. [Per-request timings, grades and answer hashes](../bench/results/inkling-native-workloads.csv)
+
 ## Original native measurements
 
 The AtomicChat Inkling-2-Mini-Uncensored AD-Q4_K checkpoint reached 104.2 generated tokens/s on the 39-task suite, 78.9 in a 14-turn chat, and 23.1 over three requests at 100K context. The native engine ran one stream with a 131,072-token session, low reasoning effort, temperature 1 and top-p 1.
