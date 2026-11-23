@@ -1,5 +1,17 @@
 # Native Inkling on one Arc Pro B70
 
+## Wider prefill with patch 0059
+
+On a cold 99,978-token source prompt, the B70 read **1,770 tokens/s** with patch 0059. Patch 0058 read **1,546 tokens/s**. The first generated token arrived in **56.68 seconds**, down from 64.82. Across three turns, the reasoning, visible text and generated lengths matched for each response, totaling 1,254 generated tokens. Pooled decode measured **53.87 tok/s**. [Per-request measurements](../bench/results/inkling-native-workloads.csv)
+
+The installed release selected an 8,192-token batch with a 131,072-token allocation. At 126,458 input tokens, cold prefill rose from 1,460 to 1,669 tok/s and time to first token fell from 86.81 to 75.95 seconds. Cold decode was 48.24 tok/s and the three-turn pooled rate was 46.62 tok/s. The two follow-ups returned their first tokens in 1.20 and 1.15 seconds. All three complete answers and reasoning digests matched 0058. An authenticated request through the normal launcher also passed. [Per-request measurements](../bench/results/inkling-native-workloads.csv)
+
+Simply increasing the prompt batch from 2,048 to 8,192 takes the cold wait down to 51.3 seconds, but oneMKL then sees different matrix shapes. In three independent executions on prefixes of the same source, top-token agreement with the 2,048 reference fell to 81.2%, 88.0% and 91.7%. The 0059 implementation expands each expert's weights once per wide batch and applies them to the same groups of rows used by the 2,048-token reference. It also preserves the decode-width kernel for a short final group.
+
+With wide staging and reference-sized products, **115,233,408 full-vocabulary target scores were byte-identical** across the three executions. Another 4,801,392 scores matched on 4,097-, 4,112- and 4,113-token inputs that straddle the decode-width boundary. A separate 98K logistics log and 51-token continuation had 100% top-token agreement and mean KL of 0.00000 at the reported precision. All 28 fixed-seed everyday, conversation, source and compaction replies matched 0058 in visible text and generated length. Both twice-compacted handoffs retained five of five requested facts. [Quality measurements and file hashes](../bench/results/inkling-native-prefill-quality.csv)
+
+The B70 launcher enables wide staging. At startup the runtime tries 8,192, 4,096, 2,048, 1,024 and 512 rows and selects the first size that fits its existing memory budget. The actual chunk appears in the load log. `WIDE_PREFILL=0` restores the previous selection policy and `PREFILL_CHUNK` pins a size for a controlled comparison. Wide-batch checkpoints use a distinct disk cache fingerprint. Apply 0059 after 0058 and rebuild the executable. [Runtime patch](../patches/0059-nextsycl-inkling-wide-prefill.patch) · [Launcher](../scripts/serve-inkling-nextsycl.sh)
+
 ## Recurrent projections with patch 0058
 
 The twelve recurrent layers use the same two source tensors during each return through the loop. Computing their four messages together reduced twelve separate launches to one. With a 2,304-wide hidden state, this part took **128 to 10 microseconds** for one row and **123 to 33 microseconds** for seven rows. All 294 tested kernel outputs matched the separate projections bit for bit.
@@ -99,7 +111,7 @@ Apply patch 0054 to nextsycl commit `e3f1fd891b7fda6f478a326d913d28893a4e9811`, 
 
 The GPU kernels load the original Q4_K gate/up and Q5_0 down experts. The 32K head supplies up to six DSpark proposals at a draft confidence threshold of 0.65. The target verifies each proposal with full-vocabulary sampling. The patch also adds bearer authentication to the HTTP endpoint. Verification included exact agreement with GGML on 155,520 sampled expert weights expanded to half precision, a full-vocabulary sampling distribution check, and identical generated text across three fixed-seed prompts with the full and reduced proposal heads.
 
-The GGUF records 1,048,576 tokens as its context length. The measurements above used the 131,072-token launcher configuration. [Model card](https://thinkingmachines.ai/model-card/inkling-2-mini/)
+Both the GGUF and the original model configuration (`text_config.model_max_length`) specify 1,048,576 tokens. The measurements above used the 131,072-token launcher configuration. [Model configuration](https://huggingface.co/thinkingmachines/Inkling-2-Mini/blob/main/config.json) · [Model card](https://thinkingmachines.ai/model-card/inkling-2-mini/)
 
 
 ## Follow-up latency at 100K

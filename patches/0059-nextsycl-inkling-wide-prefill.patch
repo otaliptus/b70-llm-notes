@@ -1,0 +1,193 @@
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index dbe3b8eeac14dfa507bc1d4b387c1335f2601b33..b01cb5d6171425de7370da3596b9ad7005842919 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -34,6 +34,22 @@ mod checkpoint;
+ mod dspark;
+ use checkpoint::{Anchor, BufferImage, restore_ring, save_ring};
+ 
++// The reference prompt path chooses oneMKL problems from batches of this many
++// source tokens. Wider staging reuses expanded weights across those same problems.
++pub(super) const PROMPT_GEMM_ROWS: usize = 2048;
++
++fn prompt_pass_rows(remaining: usize, capacity: usize) -> usize {
++    let group = if capacity >= PROMPT_GEMM_ROWS { capacity / PROMPT_GEMM_ROWS * PROMPT_GEMM_ROWS } else { capacity };
++    let count = remaining.min(group);
++    let tail = count % PROMPT_GEMM_ROWS;
++    if count > PROMPT_GEMM_ROWS && (1..=MAXV).contains(&tail) {
++        // The reference computes this tail with the small-batch decode kernels.
++        count - tail
++    } else {
++        count
++    }
++}
++
+ fn e(x: impl std::fmt::Display) -> Error {
+     Error(x.to_string())
+ }
+@@ -463,7 +479,14 @@ impl<'g> Inkling2<'g> {
+         let ctx = if kv.0 > 0 { kv.0 } else { 32768 };
+         let margin: u64 = 1536 << 20;
+         let w16_bytes = [g.heads * g.head * g.n_embd, 2 * g.n_ff * g.n_embd].into_iter().max().unwrap_or(0) * 2;
+-        let tries: Vec<usize> = chunk_setting().map_or_else(|| vec![2048, 1024, 512], |c| vec![c]);
++        // The B70 launcher opts in to wider staging. Other callers keep their existing
++        // allocation policy, and an explicitly requested chunk takes precedence.
++        let wide = std::env::var("NS_INK2_WIDE_PREFILL").is_ok_and(|value| value == "1");
++        let tries: Vec<usize> = match chunk_setting() {
++            Some(rows) => vec![rows],
++            None if wide => vec![8192, 4096, 2048, 1024, 512],
++            None => vec![2048, 1024, 512],
++        };
+         // the drafter (its file beside the model), when asked for, there and the silo loaded
+         let dfile = match (draft && dspark::draft_count() != Some(0), silo, dspark::draft_path(f)) {
+             (true, Some(_), Some(p)) => match Gguf::open(&p) {
+@@ -802,7 +825,14 @@ impl<'g> Inkling2<'g> {
+         }
+         if w.ty == GType::F32 {
+             // SAFETY: x [t, cols], the matrix [rows, cols] float32, y [t, rows].
+-            return self.op("gemm", || unsafe { (k.gemm)(self.raw(), t as i64, n, kk, x.fp(), kk, w.buf.fp(), y.fp(), n, 0) });
++            for first in (0..t).step_by(PROMPT_GEMM_ROWS) {
++                let count = (t - first).min(PROMPT_GEMM_ROWS);
++                self.op("gemm", || unsafe {
++                    (k.gemm)(self.raw(), count as i64, n, kk, x.fp().add(first * w.cols), kk,
++                             w.buf.fp(), y.fp().add(first * w.rows), n, 0)
++                })?;
++            }
++            return Ok(());
+         }
+         let elems = w.rows * w.cols;
+         if elems * 2 > self.w16.len {
+@@ -817,7 +847,13 @@ impl<'g> Inkling2<'g> {
+         let mark = self.arena.mark();
+         let xh = self.ab(t * w.cols * 2)?;
+         self.op("to half", || unsafe { (k.to_f16)(self.raw(), x.fp(), xh.ptr().cast(), (t * w.cols) as i64) })?;
+-        self.op("gemm f16", || unsafe { (k.gemm_f16)(self.raw(), t as i64, n, kk, xh.ptr().cast(), kk, self.w16.ptr().cast(), y.fp(), n, 0) })?;
++        for first in (0..t).step_by(PROMPT_GEMM_ROWS) {
++            let count = (t - first).min(PROMPT_GEMM_ROWS);
++            self.op("gemm f16", || unsafe {
++                (k.gemm_f16)(self.raw(), count as i64, n, kk, xh.ptr().cast::<u16>().add(first * w.cols), kk,
++                             self.w16.ptr().cast(), y.fp().add(first * w.rows), n, 0)
++            })?;
++        }
+         self.arena.rewind(mark);
+         Ok(())
+     }
+@@ -1090,16 +1126,23 @@ impl<'g> Inkling2<'g> {
+         let mut rs = Vec::with_capacity(m);
+         let mut at = vec![0usize; m];
+         let mut runs = Vec::new();
++        let mut tiles = Vec::new();
+         for (x, ps) in by.iter().enumerate() {
+             if ps.is_empty() {
+                 continue;
+             }
+-            runs.push((x, tok.len(), ps.len()));
+-            for &p in ps {
+-                at[p] = tok.len();
+-                tok.push((p / kk) as i32);
+-                rs.push(gu.scale_h[x]);
++            // Preserve the oneMKL problem sizes of 2,048-token prompt passes. Each
++            // expert is still expanded just once for every physical prompt chunk.
++            let first = tiles.len();
++            for tile in ps.chunk_by(|a, b| a / kk / PROMPT_GEMM_ROWS == b / kk / PROMPT_GEMM_ROWS) {
++                tiles.push((tok.len(), tile.len()));
++                for &p in tile {
++                    at[p] = tok.len();
++                    tok.push((p / kk) as i32);
++                    rs.push(gu.scale_h[x]);
++                }
+             }
++            runs.push((x, first..tiles.len()));
+         }
+         // each token's entries: its K rows, weighted (the down product's scale folded in)
+         let mut t_ptr = Vec::with_capacity(t + 1);
+@@ -1132,22 +1175,26 @@ impl<'g> Inkling2<'g> {
+         // SAFETY: rows of h gathered to half, [m, C]
+         self.op("gather", || unsafe { (k.gather_f16)(self.raw(), h.fp(), tok_d.ptr().cast(), xh.ptr().cast(), m as i64, c as i64) })?;
+         let (gn, gk) = (gu.rows as i64, gu.cols as i64);
+-        for &(x, r0, n) in &runs {
++        for (x, range) in &runs {
+             // SAFETY: expert x's gate|up -> half in w16 (from its blocks, or the silo's repacked stack); its rows' product.
+-            self.expand_expert(gu, x, g.experts)?;
+-            self.op("gemm f16", || unsafe {
+-                (k.gemm_f16)(self.raw(), n as i64, gn, gk, xh.ptr().cast::<u16>().add(r0 * c), gk, self.w16.ptr().cast(), y.fp().add(r0 * gu.rows), gn, 0)
+-            })?;
++            self.expand_expert(gu, *x, g.experts)?;
++            for &(r0, n) in &tiles[range.clone()] {
++                self.op("gemm f16", || unsafe {
++                    (k.gemm_f16)(self.raw(), n as i64, gn, gk, xh.ptr().cast::<u16>().add(r0 * c), gk, self.w16.ptr().cast(), y.fp().add(r0 * gu.rows), gn, 0)
++                })?;
++            }
+         }
+         // SAFETY: [m, 2F] scaled by its expert's factor -> SiTU in half [m, F]
+         self.op("situ", || unsafe { (k.situ)(self.raw(), y.fp(), rs_d.fp(), std::ptr::null_mut(), act.ptr().cast(), m as i64, ff as i64, g.situ_beta, g.situ_lb) })?;
+         let (dn_n, dn_k) = (dn.rows as i64, dn.cols as i64);
+-        for &(x, r0, n) in &runs {
++        for (x, range) in &runs {
+             // SAFETY: expert x's down -> half in w16; its rows' product.
+-            self.expand_expert(dn, x, g.experts)?;
+-            self.op("gemm f16", || unsafe {
+-                (k.gemm_f16)(self.raw(), n as i64, dn_n, dn_k, act.ptr().cast::<u16>().add(r0 * ff), dn_k, self.w16.ptr().cast(), d.fp().add(r0 * c), dn_n, 0)
+-            })?;
++            self.expand_expert(dn, *x, g.experts)?;
++            for &(r0, n) in &tiles[range.clone()] {
++                self.op("gemm f16", || unsafe {
++                    (k.gemm_f16)(self.raw(), n as i64, dn_n, dn_k, act.ptr().cast::<u16>().add(r0 * ff), dn_k, self.w16.ptr().cast(), d.fp().add(r0 * c), dn_n, 0)
++                })?;
++            }
+         }
+         out.fill(0)?;
+         // SAFETY: each token's rows weighted into out [t, C]
+@@ -1761,12 +1808,13 @@ impl<'g> Inkling2<'g> {
+     pub fn feed_until(&self, s: &mut Session, tokens: &[u32], stop: &(dyn Fn(usize) -> bool + Sync), tap: Tap) -> Result<(usize, Vec<f32>)> {
+         let mut logits = Vec::new();
+         let mut done = 0;
+-        for c in tokens.chunks(self.chunk) {
++        while done < tokens.len() {
+             if done > 0 && stop(done) {
+                 break;
+             }
+-            logits = self.pass(s, c, 1, &mut *tap)?.pop().unwrap_or_default();
+-            done += c.len();
++            let end = done + prompt_pass_rows(tokens.len() - done, self.chunk);
++            logits = self.pass(s, &tokens[done..end], 1, &mut *tap)?.pop().unwrap_or_default();
++            done = end;
+         }
+         Ok((done, logits))
+     }
+@@ -1987,3 +2035,19 @@ pub fn mat(f: &Gguf, gpu: &Arc<Gpu>, silo: Option<&ffi::Silo>, name: &str, loade
+     }
+     Ok(Mat { buf, ty: t.ty, rows, cols, packed: false })
+ }
++
++
++#[cfg(test)]
++mod prompt_batch_tests {
++    use super::prompt_pass_rows;
++
++    #[test]
++    fn wide_staging_preserves_short_final_decode_passes() {
++        for (remaining, capacity, expected) in [
++            (100, 64, 64), (13, 8192, 13), (2048, 8192, 2048), (2051, 8192, 2048),
++            (4105, 8192, 4096), (4113, 8192, 4113), (9000, 8192, 8192), (5000, 3072, 2048),
++        ] {
++            assert_eq!(prompt_pass_rows(remaining, capacity), expected);
++        }
++    }
++}
+diff --git a/llm/inkling2/src/lib.rs b/llm/inkling2/src/lib.rs
+index d04c993e78ab102ef31af3006f7b7fe5436d4fb4..3a5a96cbf0a462d5a080f4e64605b6f0eca5cc00 100644
+--- a/llm/inkling2/src/lib.rs
++++ b/llm/inkling2/src/lib.rs
+@@ -115,7 +115,10 @@ impl Engine for engine::Inkling2<'_> {
+         engine::Inkling2::max_verify(self)
+     }
+     fn cache_fingerprint(&self) -> String {
+-        format!("inkling2 f16-kv conv-state nsink-1 chunk={}{}", self.prefill_chunk(), if self.has_draft() { " dspark" } else { "" })
++        let chunk = self.prefill_chunk();
++        let draft = if self.has_draft() { " dspark" } else { "" };
++        let grouping = if chunk > engine::PROMPT_GEMM_ROWS { " gemm2048-v1" } else { "" };
++        format!("inkling2 f16-kv conv-state nsink-1 chunk={chunk}{draft}{grouping}")
+     }
+     fn session(&self, max_ctx: usize) -> Result<Session> {
+         Ok(Session::new(engine::Inkling2::session(self, max_ctx)?))
