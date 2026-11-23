@@ -1,5 +1,11 @@
 # Native Inkling on one Arc Pro B70
 
+## Recurrent projections with patch 0058
+
+The twelve recurrent layers use the same two source tensors during each return through the loop. Computing their four messages together reduced twelve separate launches to one. With a 2,304-wide hidden state, this part took **128 to 10 microseconds** for one row and **123 to 33 microseconds** for seven rows. All 294 tested kernel outputs matched the separate projections bit for bit.
+
+In the six everyday tasks, the recurrent-projection build averaged **102.97 decode tok/s**, compared with 99.64 on 0056. The two source-reading requests went from 79.13 to **81.28**, and the fourteen-turn conversation went from 78.83 to **81.63**. All 22 visible answers, generated lengths and draft acceptance counts matched. This build included the batched convolution rollback. The final 0058 patch also writes the target output projection directly into its destination and reads draft IDs and probabilities in one transfer. Its 153,644,544 scored target logits matched the 0054 control across four runs at 7.3K, 40K and 100K. Apply 0058 after 0057 and rebuild the executable and Inkling silo. [Workload counters](../bench/results/inkling-native-workloads.csv) · [Logit hashes](../bench/results/inkling-native-long-logits.csv) · [Runtime patch](../patches/0058-nextsycl-inkling-recurrent-projections.patch)
+
 ## Long-context performance with patch 0056
 
 One B70 generated the same 1,254 tokens at **52.31 tok/s** across a three-turn source-reading conversation. The original runtime averaged **23.20 tok/s**. The cold request read 99,978 tokens at **1,543 tok/s**, up from **1,023 tok/s**. All three answers, generation lengths and draft acceptance counts matched at fixed seeds. [Per-turn counters and answer hashes](../bench/results/inkling-native-long-attention.csv)

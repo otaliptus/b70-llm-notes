@@ -1,0 +1,240 @@
+diff --git a/kernels/llm/inkling2/silo/dec.cpp b/kernels/llm/inkling2/silo/dec.cpp
+index df9000bd8d2e8b64a7afaa7829c8c3188f898fa1..0243090c59a982906ff88e027b582510833da9ae 100644
+--- a/kernels/llm/inkling2/silo/dec.cpp
++++ b/kernels/llm/inkling2/silo/dec.cpp
+@@ -186,6 +186,55 @@ void mix_launch(sycl::queue& q, MixArgs a, int64_t T) {
+     });
+ }
+ 
++// Each query is independent. This path writes an unnormalized mix directly and can
++// calculate the messages of a recurrent pass together, from its two fixed inputs.
++struct LayerQueries { const float* p[16]; };
++
++template <int S>
++void mix_plain(sycl::queue& queue, MixArgs a, LayerQueries qs, int layers) {
++    constexpr int W = 576, NV = 2 * S;
++    queue.submit([&](sycl::handler& h) {
++        sycl::local_accessor<float, 1> sums(sycl::range<1>(W / SG * NV + NV), h);
++        h.parallel_for(sycl::nd_range<1>(size_t(layers) * a.nq * a.T * W, W),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++            const int group = it.get_group_linear_id(), tid = it.get_local_linear_id();
++            const int t = group % a.T, qi = group / a.T % a.nq, layer = group / (a.T * a.nq);
++            const auto* q = reinterpret_cast<const sycl::float4*>(qs.p[layer] + qi * a.C);
++            float part[NV] = {}, total[NV];
++            for (int i = tid; i < a.C / 4; i += W) {
++                const sycl::float4 w = q[i];
++#pragma unroll
++                for (int s = 0; s < S; ++s) {
++                    const sycl::float4 x = reinterpret_cast<const sycl::float4*>(a.st[s] + t * a.C)[i];
++                    part[s] += x.x()*x.x() + x.y()*x.y() + x.z()*x.z() + x.w()*x.w();
++                    part[S+s] += x.x()*w.x() + x.y()*w.y() + x.z()*w.z() + x.w()*w.w();
++                }
++            }
++            group_sums<NV>(it, part, sums.get_multi_ptr<sycl::access::decorated::no>().get(), total);
++            float inv[S], p[S], mx = -INFINITY, sum = 0.f;
++            const float sc = 1.f / sycl::sqrt(float(a.C));
++#pragma unroll
++            for (int s = 0; s < S; ++s) {
++                inv[s] = sycl::rsqrt(total[s] / float(a.C) + a.eps_mix);
++                p[s] = total[S+s] * inv[s] * sc;
++                mx = sycl::fmax(mx, p[s]);
++            }
++#pragma unroll
++            for (int s = 0; s < S; ++s) { p[s] = sycl::exp(p[s] - mx); sum += p[s]; }
++#pragma unroll
++            for (int s = 0; s < S; ++s) p[s] = p[s] / sum * inv[s];
++            auto* dst = reinterpret_cast<sycl::float4*>(a.out + size_t(group) * a.C);
++            for (int i = tid; i < a.C / 4; i += W) {
++                sycl::float4 y(0.f);
++#pragma unroll
++                for (int s = 0; s < S; ++s)
++                    y += p[s] * reinterpret_cast<const sycl::float4*>(a.st[s] + t * a.C)[i];
++                dst[i] = y;
++            }
++        });
++    });
++}
++
+ }  // namespace
+ 
+ extern "C" {
+@@ -209,6 +258,18 @@ int ns_ink2s_mix_norm(ns_gpu* g, const float* const* states, int64_t ns, const f
+     a.eps_mix = eps_mix;
+     a.eps_norm = eps_norm;
+     if (T <= 0) return 0;
++    bool plain = true;
++    for (int q = 0; q < nq; ++q) plain = plain && !a.nw[q];
++    if (plain && ink_b70::supported(g->dev)) {
++        LayerQueries queries{};
++        queries.p[0] = query;
++        switch (ns) {
++#define PLAIN(S) case S: mix_plain<S>(g->q, a, queries, 1); break;
++            PLAIN(1) PLAIN(2) PLAIN(3) PLAIN(4) PLAIN(5) PLAIN(6) PLAIN(7) PLAIN(8)
++#undef PLAIN
++        }
++        return 0;
++    }
+     // a work-group a row: one pass over the channels (16-byte loads) for the states' sums of squares and the (query,
+     // state) dots; every query's mix in a second, with its sum of squares; then each normed, written and quantized
+     // the kernel sized to the call: states and queries as template arguments, 576 threads (C / 4 for 2304)
+@@ -224,6 +285,20 @@ int ns_ink2s_mix_norm(ns_gpu* g, const float* const* states, int64_t ns, const f
+     NS_CATCH
+ }
+ 
++int ns_ink2s_mix_loop(ns_gpu* g, const float* previous, const float* output, const float* const* queries, int layers, float* messages, int64_t T, int64_t C) {
++    NS_TRY
++    if (layers < 1 || layers > 16 || T < 1 || T > 16 || C < 128 || C > 2304 || C % 128)
++        return ns_fail("ns_ink2s_mix_loop: unsupported message shape");
++    MixArgs a{};
++    a.st[0] = previous; a.st[1] = output;
++    a.ns = 2; a.nq = 4; a.out = messages; a.T = T; a.C = C; a.eps_mix = 1e-6f;
++    LayerQueries qs{};
++    for (int l = 0; l < layers; ++l) qs.p[l] = queries[l];
++    mix_plain<2>(g->q, a, qs, layers);
++    return 0;
++    NS_CATCH
++}
++
+ int ns_ink2s_conv_res(ns_gpu* g, const float* x, float* state, const float* w, float* snap, const float* base, float* dst, float* out, int64_t T, int64_t C,
+                       float inv) {
+     NS_TRY
+diff --git a/kernels/llm/inkling2/silo/silo.h b/kernels/llm/inkling2/silo/silo.h
+index 59986632a441c78ab1d4c3d12e6dcba1206f6624..ff125faaa09fc2bf8b5336bd9c346846bce7be70 100644
+--- a/kernels/llm/inkling2/silo/silo.h
++++ b/kernels/llm/inkling2/silo/silo.h
+@@ -109,6 +109,8 @@ int ns_ink2s_mix_norm(ns_gpu* g, const float* const* states, int64_t ns, const f
+                       void* const* xq, int64_t T, int64_t C, float eps_mix, float eps_norm);
+ /* a short convolution with its residual: dst [T, C] = base (nullable; may be dst) + (x + conv(x)) inv, the state [3, C]
+  * updated, snap (nullable) [3 + T, C] the state then the rows, out (nullable) the convolution's rows */
++/* All recurrent layer messages for one pass, [layers, 4, T, C]. */
++int ns_ink2s_mix_loop(ns_gpu* g, const float* previous, const float* output, const float* const* queries, int layers, float* messages, int64_t T, int64_t C);
+ int ns_ink2s_conv_res(ns_gpu* g, const float* x, float* state, const float* w, float* snap, const float* base, float* dst, float* out, int64_t T, int64_t C,
+                       float inv);
+ /* the attention's inputs after their projections, in one launch: k and v through their convolutions (the full layers'
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index c557ad03dfa6d46026b44bc03afe37946220f864..dbe3b8eeac14dfa507bc1d4b387c1335f2601b33 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -425,7 +425,9 @@ fn arena_bytes(g: &Geometry, chunk: usize) -> usize {
+     let ffn = row(3 * c) + ctrl.max(row(g.experts + 2 * g.used) + rows * (c * 2 + row(2 * g.n_ff) + g.n_ff * 2 + row(c)) + rows * 16) + row(c);
+     let per_row = persistent + attn.max(ffn) + row(c);
+     // a quarter more for the arena's 256-byte alignment and what the count above leaves out
+-    chunk * per_row * 5 / 4 + MAXV * g.vocab_pad * 4 * 3 + (64 << 20)
++    // A decode pass can stage the four messages of every recurrent layer together.
++    let loop_scratch = MAXV * (g.core.1 - g.core.0).saturating_sub(1).min(15) * 4 * row(c);
++    chunk * per_row * 5 / 4 + MAXV * g.vocab_pad * 4 * 3 + loop_scratch + (64 << 20)
+ }
+ 
+ /// The bytes of a session's caches for `max_ctx` and passes of `chunk` rows
+@@ -1541,8 +1543,14 @@ impl<'g> Inkling2<'g> {
+         let s12_prev = self.f32(t * c)?;
+         let s18 = self.f32(t * c)?;
+         let pout = self.f32(t * c)?;
+-        let msgs = self.f32(4 * t * c)?;
+         let (cs, ce) = g.core;
++        let layers = ce - cs;
++        let mix_loop = self.fused(t).and_then(|sl| sl.fused.mix_loop).filter(|_| (1..=16).contains(&layers));
++        let queries: Vec<*const f32> = self.loops.iter().map(|lp| lp.msg_q.fp() as *const f32).collect();
++        let (mix_loop, msgs) = match mix_loop.and_then(|f| self.f32(layers * 4 * t * c).ok().map(|mem| (f, mem))) {
++            Some((f, mem)) => (Some(f), mem),
++            None => (None, self.f32(4 * t * c)?),
++        };
+         let mut blocks: Vec<DevBuf> = Vec::new();
+         // where the stream is now; the next layer writes the other buffer
+         let mut cur: DevBuf = x0.view(0, tc)?;
+@@ -1562,6 +1570,12 @@ impl<'g> Inkling2<'g> {
+                     }
+                     s12_prev.copy_within(0, &s12, 0, tc)?;
+                     pout.copy_within(0, &cur, 0, tc)?;
++                    if let Some(f) = mix_loop {
++                        // The previous bank and its output are constant throughout the next recurrent pass.
++                        self.op("loop messages", || unsafe {
++                            f(self.raw(), s12_prev.fp(), pout.fp(), queries.as_ptr(), layers as i32, msgs.fp(), t as i64, c as i64)
++                        })?;
++                    }
+                     blocks.truncate(prelude_blocks);
+                 }
+                 cur = pre.view(0, tc)?;
+@@ -1572,7 +1586,11 @@ impl<'g> Inkling2<'g> {
+                 keep.copy_within(0, &cur, 0, tc)?;
+                 cur = keep.view(0, tc)?;
+             }
+-            let lp = if p > 0 {
++            let message;
++            let lp = if p > 0 && mix_loop.is_some() {
++                message = msgs.view((l - cs) * 4 * tc, 4 * tc)?;
++                Some((&self.loops[l - cs], &message))
++            } else if p > 0 {
+                 let lp = &self.loops[l - cs];
+                 let mk = self.arena.mark();
+                 let m = match self.fused(t) {
+@@ -1628,9 +1646,8 @@ impl<'g> Inkling2<'g> {
+         for r0 in (0..n).step_by(MAXV) {
+             let rn = (n - r0).min(MAXV);
+             let x = normed.view(r0 * c * 4, rn * c * 4)?;
+-            let xq = self.xq(&x, c, rn)?;
+-            let y = self.mmq(&self.output, &x, xq.as_ref(), rn)?;
+-            raw.copy_within(r0 * vp * 4, &y, 0, rn * vp * 4)?;
++            let dst = raw.view(r0 * vp * 4, rn * vp * 4)?;
++            self.matmul(&self.output, &x, rn, &dst)?;
+         }
+         let logits = self.f32(n * v)?;
+         // SAFETY: n rows of vp -> n rows of v, soft-capped
+diff --git a/llm/inkling2/src/engine/dspark.rs b/llm/inkling2/src/engine/dspark.rs
+index 04596d7411b54985bf80348851510f8fe0001f86..cb1ea502ba8c1735c4a0c0c35f9ceb229894374f 100644
+--- a/llm/inkling2/src/engine/dspark.rs
++++ b/llm/inkling2/src/engine/dspark.rs
+@@ -473,7 +473,9 @@ impl Inkling2<'_> {
+         let vocab = if d.full_ids.is_some() { vp } else { g.vocab };
+         let base = self.mmq(proposal_head, &hid, hq.as_ref(), nd)?;
+         // the Markov head, a position at a time: the token before it (the tail first), the hidden row, f_rnn
+-        let toks = self.ab((nd + 1) * 4)?;
++        // Token IDs and confidence values are consumed together after the last proposal.
++        let result = self.ab((2 * nd + 1) * 4)?;
++        let toks = result.view(0, (nd + 1) * 4)?;
+         toks.write_async(0, &tail.to_le_bytes())?;
+         let state = self.f32(d.rank)?;
+         state.fill(0)?;
+@@ -481,7 +483,7 @@ impl Inkling2<'_> {
+         let inp = self.f32(2 * d.rank + 2 * c)?;
+         let proj = self.f32(3 * d.rank)?;
+         let bias = self.f32(vp)?;
+-        let probs = self.f32(nd)?;
++        let probs = result.view((nd + 1) * 4, nd * 4)?;
+         // set by the pick of a draft below p_min: the later steps' heaviest launches (the fold, the pick) do nothing
+         let pmin = draft_pmin();
+         let stop = self.ab(4)?;
+@@ -511,10 +513,9 @@ impl Inkling2<'_> {
+                                                           d.full_ids.as_ref().map_or(std::ptr::null(), |b| b.ptr().cast())))?
+             };
+         }
+-        let mut b = vec![0u8; (nd + 1) * 4];
+-        toks.read(0, &mut b)?;
+-        let mut pb = vec![0u8; nd * 4];
+-        probs.read(0, &mut pb)?;
++        let mut result_bytes = vec![0u8; result.len];
++        result.read(0, &mut result_bytes)?;
++        let (b, pb) = result_bytes.split_at((nd + 1) * 4);
+         // the drafts up to the first the drafter is not sure enough of (NS_INK2_DRAFT_PMIN: its probability)
+         let sure = pb.chunks_exact(4).take_while(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) >= pmin).count();
+         Ok(b.chunks_exact(4).skip(1).take(sure).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+diff --git a/llm/inkling2/src/ffi.rs b/llm/inkling2/src/ffi.rs
+index 9a66ff02c1c32d10d25f2f9d26b191e4303c2f41..03d1a458cad9a6e2e8d61504e0588fb102033477 100644
+--- a/llm/inkling2/src/ffi.rs
++++ b/llm/inkling2/src/ffi.rs
+@@ -205,6 +205,7 @@ pub struct Fused {
+     pub post_qkv: unsafe extern "C" fn(G, *const Qkv) -> c_int,
+     /// (part, sink, gate, out, xq, T, Hq, ns)
+     pub merge_gate_xq: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64) -> c_int,
++    pub mix_loop: Option<unsafe extern "C" fn(G, *const f32, *const f32, *const *const f32, c_int, *mut f32, i64, i64) -> c_int>,
+     pub conv_keep_many: Option<unsafe extern "C" fn(G, c_int, *const *const f32, *const *mut f32, *const i64, c_int, c_int) -> c_int>,
+     pub merge_exact: Option<unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64, *mut f32) -> c_int>,
+     /// (cur, msg, down, u, T, C, rank, eps)
+@@ -343,6 +344,7 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+                 post_qkv: sym!("ns_ink2s_post_qkv"),
+                 merge_gate_xq: sym!("ns_ink2s_merge_gate_xq"),
+                 merge_exact: optional!("ns_ink2s_merge_exact"),
++                mix_loop: optional!("ns_ink2s_mix_loop"),
+                 conv_keep_many: optional!("ns_ink2s_conv_keep_many"),
+                 ctrl_down: sym!("ns_ink2s_ctrl_down"),
+                 ctrl_down_many: sym!("ns_ink2s_ctrl_down_many"),
