@@ -46,6 +46,22 @@ The same patch batches convolution history repair after the verifier rejects a p
 
 Rates divide total tokens by the corresponding total engine time. Decode includes reasoning and visible output. The unmodified graded suite drew 57,870 tokens and passed 35 of 39, compared with 54,037 tokens and 34 of 39 in the original run. It samples different answers between runs. The other four workloads used fixed seeds. All 28 visible answers and generated lengths matched the original runtime. All six everyday tasks and both source handoff tasks passed their checks. Each compaction exercise generated two summaries and answered a question after a context reset. Both retained all five requested facts, including the current bay, booking and owner. [Per-request timings, grades and answer hashes](../bench/results/inkling-native-workloads.csv)
 
+## Replay the long conversations
+
+The source-reading replay starts with a 99,978-token or 126,458-token request and sends two follow-ups containing the model's actual visible answers. Supply a separate fixture checkout at the pinned revision with only patch 0054 applied. The runner verifies the source text hash before sending it. Run these commands from the notes repository with the server already listening and `API_KEY_FILE` pointing to its key.
+
+```sh
+notes=$PWD
+git clone https://github.com/maxfridbe/nextsycl.git /tmp/inkling-fixture
+git -C /tmp/inkling-fixture checkout --detach e3f1fd891b7fda6f478a326d913d28893a4e9811
+git -C /tmp/inkling-fixture apply "$notes/patches/0054-nextsycl-atomic-inkling-b70.patch"
+python3 bench/inkling_context.py --source /tmp/inkling-fixture --case 100k >100k.jsonl
+```
+
+Restart the single-stream server with an empty prompt cache before each cold case. Use `--case 126k` for the near-limit run or `--case branches` for the five-turn branching workload. The published branching comparison used `PROMPT_CACHE_MIB=2560` and both near-limit controls used 6144. For the two independent compaction exercises, run `python3 bench/inkling_context.py --case compaction`. Each shift supplies a new log of about 98K tokens. Only the model's handoff carries over to the next shift. The final answer is graded against five fields.
+
+Per-turn JSON includes fresh and reused tokens, engine read and generation seconds, first generated and first visible text latency, and SHA-256 hashes of the reasoning and answer. The final rates printed to standard error divide total tokens by total engine time. The public runner reproduced all three visible answers, generated lengths and prompt counts from the 100K reference in a 0058 replay. [Replay script](../bench/inkling_context.py)
+
 ## Original native measurements
 
 The AtomicChat Inkling-2-Mini-Uncensored AD-Q4_K checkpoint reached 104.2 generated tokens/s on the 39-task suite, 78.9 in a 14-turn chat, and 23.1 over three requests at 100K context. The native engine ran one stream with a 131,072-token session, low reasoning effort, temperature 1 and top-p 1.
