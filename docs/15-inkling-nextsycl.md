@@ -1,5 +1,21 @@
 # Native Inkling on one Arc Pro B70
 
+## Long-context performance with patch 0056
+
+One B70 generated the same 1,254 tokens at **52.31 tok/s** across a three-turn source-reading conversation. The original runtime averaged **23.20 tok/s**. The cold request read 99,978 tokens at **1,543 tok/s**, up from **1,023 tok/s**. All three answers, generation lengths and draft acceptance counts matched at fixed seeds. [Per-turn counters and answer hashes](../bench/results/inkling-native-long-attention.csv)
+
+| Turn | Original decode tok/s | Patch 0056 decode tok/s | Original first token | Patch 0056 first token |
+|---|---:|---:|---:|---:|
+| Cold source | 24.24 | 55.76 | 98.00 s | 64.98 s |
+| Configuration question | 23.29 | 52.82 | 3.96 s | 1.19 s |
+| Runbook handoff | 22.17 | 48.98 | 3.96 s | 1.15 s |
+
+The patch tiles full-attention prompt reads and groups several decode queries so they can share key and value reads. The GPU computes each split's merge coefficient once. The sums retain the original floating-point operation order. Cached conversations also restore just the portions of sliding attention rings that subsequent writes could have overwritten.
+
+At each of 192 continuation positions, the runtime exported all 200,058 target logits. Five runs covered prompt lengths of roughly 7.3K, 40K and 100K tokens, with forward passes of one, four or seven rows. Each complete output file matched its control byte for byte. The three distinct text fixtures cover a narrower range of content than the five executions. The model, quantization, sampling distribution, draft head and configured context were the same throughout. Apply 0056 after 0055 and rebuild the executable and the Inkling silo. [Output hashes](../bench/results/inkling-native-long-logits.csv) · [Runtime patch](../patches/0056-nextsycl-inkling-long-attention.patch)
+
+## Original native measurements
+
 The AtomicChat Inkling-2-Mini-Uncensored AD-Q4_K checkpoint reached 104.2 generated tokens/s on the 39-task suite, 78.9 in a 14-turn chat, and 23.1 over three requests at 100K context. The native engine ran one stream with a 131,072-token session, low reasoning effort, temperature 1 and top-p 1.
 
 | Workload | Requests | Prefill tok/s | Decode tok/s | Median first streamed token |

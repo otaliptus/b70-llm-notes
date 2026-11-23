@@ -1,0 +1,628 @@
+diff --git a/kernels/llm/inkling2/silo/attn.cpp b/kernels/llm/inkling2/silo/attn.cpp
+index 864d412..e6cd090 100644
+--- a/kernels/llm/inkling2/silo/attn.cpp
++++ b/kernels/llm/inkling2/silo/attn.cpp
+@@ -6,6 +6,9 @@
+ #include "ns.h"
+ #include "ns_internal.hpp"
+ #include "silo.h"
++#include "b70.hpp"
++#include "attn_long.hpp"
++#include <type_traits>
+ 
+ #include <sycl/sycl.hpp>
+ #include <cmath>
+@@ -35,6 +38,21 @@ static int attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* vc
+     if (Hq != G * Hkv || R > SG || T < 1 || T > 16) return ns_fail("ns_ink2s_attn_part: 3 query heads a key head, a bias of at most 16, 1..16 rows");
+     int64_t s0, ns;
+     range(T, p0, win, s0, ns);
++    int64_t prefix = 0;
++    if (win == 0 && p0 >= 4096 && T <= 8 && p0 + T <= cap && E >= 0 && ink_b70::supported(g->dev)) {
++        prefix = (p0 + 1 - sycl::min(p0+1,E)) / KB;
++        if (prefix) {
++            auto launch = [&](auto qn) {
++                ink_decode::dot<decltype(qn)::value>(g->q,qp,(const half*)kcv,part,T,Hq,Hkv,cap,ns,prefix,scale);
++            };
++            if (T == 1) launch(std::integral_constant<int,4>{});
++            else if (T == 2) launch(std::integral_constant<int,8>{});
++            else if (T <= 5) launch(std::integral_constant<int,16>{});
++            else launch(std::integral_constant<int,32>{});
++            ink_decode::value(g->q,(const half*)vcv,part,T,Hq,Hkv,cap,ns,prefix);
++        }
++    }
++    if (prefix == ns) return 0;
+     const half* kc = (const half*) kcv;
+     const half* vc = (const half*) vcv;
+     constexpr int WG = G * SG;
+@@ -43,12 +61,12 @@ static int attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* vc
+         sycl::local_accessor<half, 1> vs(sycl::range<1>((size_t) KB * D), h);
+         // each sub-group's query (scaled), bias query, the split's probabilities
+         sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) G * (D + SG + KB)), h);
+-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * Hkv * ns) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * Hkv * (ns - prefix)) * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+             auto sg = it.get_sub_group();
+             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+             int64_t gi = it.get_group(0);
+-            const int64_t sp = gi % ns;
+-            gi /= ns;
++            const int64_t sp = prefix + gi % (ns - prefix);
++            gi /= ns - prefix;
+             const int64_t hk = gi % Hkv, rr = gi / Hkv, hq = hk * G + sgi;
+             // a block (the drafter's): every row sees the window from the block's start and the whole block
+             const int64_t pos = p0 + rr, wpos = block ? p0 : pos;
+diff --git a/kernels/llm/inkling2/silo/attn_long.hpp b/kernels/llm/inkling2/silo/attn_long.hpp
+new file mode 100644
+index 0000000..99b7684
+--- /dev/null
++++ b/kernels/llm/inkling2/silo/attn_long.hpp
+@@ -0,0 +1,113 @@
++// Full 64-key splits preceding the relative-bias window. The dot product follows the
++// original lane rotation. The same FP32 softmax reductions and value order are used.
++#pragma once
++#include <cmath>
++#include <sycl/ext/intel/esimd.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++namespace ink_decode {
++namespace es = sycl::ext::intel::esimd;
++using half = sycl::half;
++constexpr int SG = 16, D = 128, G = 3, KB = 64;
++
++template <int QP>
++void dot(sycl::queue& queue, const float* q, const half* keys, float* part, int T, int Hq, int Hkv, int cap, int ns, int prefix,
++         float scale) {
++    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
++    queue.parallel_for(sycl::nd_range<1>(size_t(Hkv * prefix) * SG, SG), props, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++        es::slm_init<D * QP * 4>();
++        int gi = it.get_group_linear_id(), hk = gi / prefix, sp = gi % prefix, lane = it.get_local_id(0);
++        es::simd<uint32_t, 8> qoff(lane * 8 * QP * 4, QP * 4);
++        for (int qr = 0; qr < QP; ++qr) {
++            int head = (qr / G) * Hq + hk * G + qr % G;
++            es::simd<float, 8> f(0.f);
++            if (qr < T * G)
++                f = es::block_load<float, 8>(q + head * D + lane * 8) * scale;
++            es::slm_scatter<float, 8>(qoff + qr * 4, f);
++        }
++        es::barrier();
++        const half* ks = keys + (size_t(hk) * cap + sp * KB + lane) * D;
++        es::simd<half, D> k[4];
++        es::simd<float, QP> acc[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            k[u] = es::block_load<half, D>(ks + u * SG * D);
++            acc[u] = 0.f;
++        }
++        for (int c = 0; c < SG; ++c) {
++            const int d = ((c + lane) & 15) * 8;
++            es::simd<float, 8> v[4];
++#pragma unroll
++            for (int u = 0; u < 4; ++u)
++                v[u] = es::simd<half, 8>(k[u].template select<8, 1>(d));
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                auto a = es::slm_block_load<float, QP>((d + i) * QP * 4);
++#pragma unroll
++                for (int u = 0; u < 4; ++u) {
++                    es::simd<float, QP> b = float(v[u][i]);
++                    acc[u] = __builtin_elementwise_fma(a.data(), b.data(), acc[u].data());
++                }
++            }
++        }
++        for (int qr = 0; qr < T * G; ++qr) {
++            int head = (qr / G) * Hq + hk * G + qr % G;
++            float* pp = part + (size_t(head) * ns + sp) * (D + 2);
++#pragma unroll
++            for (int u = 0; u < 4; ++u)
++                pp[lane + u * SG] = acc[u][qr];
++        }
++    });
++}
++
++inline void value(sycl::queue& queue, const half* values, float* part, int T, int Hq, int Hkv, int cap, int ns, int prefix) {
++    int nq = T * G, W = nq * SG;
++    queue.submit([&](sycl::handler& h) {
++        sycl::local_accessor<half, 1> cache(sycl::range<1>(KB * D), h);
++        sycl::local_accessor<float, 1> probs(sycl::range<1>(nq * KB), h);
++        h.parallel_for(sycl::nd_range<1>(size_t(Hkv * prefix) * W, W), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++            auto sg = it.get_sub_group();
++            int gi = it.get_group_linear_id(), hk = gi / prefix, sp = gi % prefix, lane = sg.get_local_linear_id(),
++                qr = sg.get_group_linear_id();
++            int head = (qr / G) * Hq + hk * G + qr % G;
++            auto* vp = cache.get_multi_ptr<sycl::access::decorated::no>().get();
++            for (int i = qr; i < KB; i += nq)
++                reinterpret_cast<sycl::uint4*>(vp + i * D)[lane] =
++                    reinterpret_cast<const sycl::uint4*>(values + (size_t(hk) * cap + sp * KB + i) * D)[lane];
++            float* pp = part + (size_t(head) * ns + sp) * (D + 2);
++            auto* p = probs.get_multi_ptr<sycl::access::decorated::no>().get() + qr * KB;
++            float lg[4], m = -INFINITY;
++#pragma unroll
++            for (int u = 0; u < 4; ++u) {
++                lg[u] = pp[lane + u * SG];
++                m = sycl::fmax(m, lg[u]);
++            }
++            m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
++            float sum = 0;
++#pragma unroll
++            for (int u = 0; u < 4; ++u) {
++                float y = sycl::exp(lg[u] - m);
++                p[lane + u * SG] = y;
++                sum += y;
++            }
++            sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
++            sycl::group_barrier(it.get_group());
++            float acc[8] = {};
++            for (int j = 0; j < KB; ++j) {
++                float pr = p[j];
++                auto v = *reinterpret_cast<const sycl::vec<half, 8>*>(vp + j * D + lane * 8);
++#pragma unroll
++                for (int d = 0; d < 8; ++d)
++                    acc[d] = sycl::fma(pr, float(v[d]), acc[d]);
++            }
++#pragma unroll
++            for (int d = 0; d < 8; ++d)
++                pp[lane * 8 + d] = acc[d];
++            if (!lane) {
++                pp[D] = m;
++                pp[D + 1] = sum;
++            }
++        });
++    });
++}
++} // namespace ink_decode
+diff --git a/kernels/llm/inkling2/silo/b70.hpp b/kernels/llm/inkling2/silo/b70.hpp
+new file mode 100644
+index 0000000..9d9ac32
+--- /dev/null
++++ b/kernels/llm/inkling2/silo/b70.hpp
+@@ -0,0 +1,17 @@
++#pragma once
++#include <optional>
++#include <sycl/sycl.hpp>
++
++namespace ink_b70 {
++// The selection follows the queue's device, including when a thread changes devices.
++inline bool supported(const sycl::device& device) {
++    namespace ex = sycl::ext::oneapi::experimental;
++    static thread_local std::optional<sycl::device> last;
++    static thread_local bool enabled = false;
++    if (!last || *last != device) {
++        enabled = device.is_gpu() && device.get_info<ex::info::device::architecture>() == ex::architecture::intel_gpu_bmg_g31;
++        last = device;
++    }
++    return enabled;
++}
++} // namespace ink_b70
+diff --git a/kernels/llm/inkling2/silo/dec.cpp b/kernels/llm/inkling2/silo/dec.cpp
+index 02f8dcd..ac4f54d 100644
+--- a/kernels/llm/inkling2/silo/dec.cpp
++++ b/kernels/llm/inkling2/silo/dec.cpp
+@@ -7,6 +7,8 @@
+ #include "ns.h"
+ #include "ns_internal.hpp"
+ #include "silo.h"
++#include "b70.hpp"
++#include "merge_long.hpp"
+ 
+ #include <sycl/sycl.hpp>
+ #include <cmath>
+diff --git a/kernels/llm/inkling2/silo/merge_long.hpp b/kernels/llm/inkling2/silo/merge_long.hpp
+new file mode 100644
+index 0000000..9d77873
+--- /dev/null
++++ b/kernels/llm/inkling2/silo/merge_long.hpp
+@@ -0,0 +1,83 @@
++// Compute each split coefficient once. Preserve the coefficient and split order in
++// both the denominator and the weighted values, then apply the original gate and Q8 rounding.
++#pragma once
++#include <sycl/ext/intel/esimd.hpp>
++#include <cstdint>
++#include <cmath>
++namespace es = sycl::ext::intel::esimd;
++extern "C" int ns_ink2s_merge_exact(ns_gpu* g, const float* part, const float* sink, const float* gate, float* out, void* xq, int64_t rows,
++                                    int64_t heads, int64_t nsplit, float* scratch) {
++    NS_TRY
++    if (!ink_b70::supported(g->dev) || nsplit < 128 || nsplit > 4096)
++        return ns_ink2s_merge_gate_xq(g, part, sink, gate, out, xq, rows, heads, nsplit);
++    constexpr int D = 128, SG = 16, W = 128;
++    const int ns = (int)nsplit, groups = (int)(rows * heads);
++    float* denom = scratch + size_t(groups) * ns;
++    g->q.submit([&](sycl::handler& h) {
++        sycl::local_accessor<float, 1> l(sycl::range<1>(2 * ns), h);
++        h.parallel_for(sycl::nd_range<1>(size_t(groups) * W, W), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++            int rh = it.get_group_linear_id(), tid = it.get_local_linear_id();
++            auto group = it.get_group();
++            const float* pp = part + size_t(rh) * ns * (D + 2);
++            const float sk = sink ? sink[rh] : -INFINITY;
++            float m = sk;
++            for (int i = tid; i < ns; i += W)
++                m = sycl::fmax(m, pp[i * (D + 2) + D]);
++            m = sycl::reduce_over_group(group, m, sycl::maximum<float>());
++            float* c = l.get_multi_ptr<sycl::access::decorated::no>().get();
++            float* mass = c + ns;
++            for (int i = tid; i < ns; i += W) {
++                c[i] = sycl::exp(pp[i * (D + 2) + D] - m);
++                mass[i] = pp[i * (D + 2) + D + 1];
++                scratch[size_t(rh) * ns + i] = c[i];
++            }
++            sycl::group_barrier(group);
++            if (!tid) {
++                float z = sink ? sycl::exp(sk - m) : 0.f;
++                for (int i = 0; i < ns; ++i)
++                    z += mass[i] * c[i];
++                denom[rh] = z;
++            }
++        });
++    });
++    constexpr int B = 16, P = 16;
++    g->q.parallel_for(sycl::range<1>(size_t(groups) * (D / B)), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
++        int rh = id[0] / (D / B), off = id[0] % (D / B) * B;
++        const float* start = part + size_t(rh) * ns * (D + 2) + off;
++        const float* cp = scratch + size_t(rh) * ns;
++        es::simd<float, B> accum(0.f);
++        int i = 0;
++        for (; i + P <= ns; i += P) {
++            auto coeff = es::block_load<float, P>(cp + i);
++#pragma unroll
++            for (int j = 0; j < P; ++j) {
++                auto v = es::block_load<float, B>(start + (i + j) * (D + 2));
++                accum += v * float(coeff[j]);
++            }
++        }
++        for (; i < ns; ++i)
++            accum += es::block_load<float, B>(start + i * (D + 2)) * cp[i];
++        es::block_store<float, B>(out + rh * D + off, accum);
++    });
++    g->q.parallel_for(sycl::nd_range<1>(size_t(groups) * D / 2, SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++        int at = it.get_global_linear_id() * 2, rh = at / D;
++        float a = out[at] / denom[rh], b = out[at + 1] / denom[rh];
++        if (gate) {
++            a *= 1.f / (1.f + sycl::exp(-gate[at]));
++            b *= 1.f / (1.f + sycl::exp(-gate[at + 1]));
++        }
++        out[at] = a;
++        out[at + 1] = b;
++        auto sg = it.get_sub_group();
++        const float peak = sycl::reduce_over_group(sg, sycl::fmax(sycl::fabs(a), sycl::fabs(b)), sycl::maximum<float>());
++        const float d = peak / 127.f, inv = d != 0.f ? 1.f / d : 0.f;
++        auto* q = (int8_t*)xq;
++        q[at] = (int8_t)sycl::round(a * inv);
++        q[at + 1] = (int8_t)sycl::round(b * inv);
++        const size_t qlen = (size_t(groups) * D + 255) / 256 * 256;
++        if (sg.get_local_linear_id() == 0)
++            reinterpret_cast<float*>(q + qlen)[at / 32] = (float)sycl::half(d);
++    });
++    return 0;
++    NS_CATCH
++}
+diff --git a/kernels/llm/inkling2/silo/pattn.cpp b/kernels/llm/inkling2/silo/pattn.cpp
+index c948381..9ffc35b 100644
+--- a/kernels/llm/inkling2/silo/pattn.cpp
++++ b/kernels/llm/inkling2/silo/pattn.cpp
+@@ -22,6 +22,8 @@
+ #include <sycl/ext/oneapi/matrix/matrix.hpp>
+ #include <cmath>
+ #include <cstdint>
++#include "b70.hpp"
++#include "pattn_esimd.hpp"
+ 
+ namespace {
+ namespace jm = sycl::ext::oneapi::experimental::matrix;
+@@ -261,6 +263,10 @@ int ns_ink2s_attn_prompt(ns_gpu* g, const float* q, const void* kc, const void*
+     if (!ns_ink2s_attn_prompt_supported(Hq, Hkv, D, R) || T < 1) return ns_fail("ns_ink2s_attn_prompt: heads of 128, 3 query heads a key head, a bias of 1..16");
+     const int64_t need = win > 0 ? sycl::min(p0 + T, win + T - 1) : p0 + T;
+     if (need > cap) return ns_fail("ns_ink2s_attn_prompt: the cache's ring is shorter than the window and the pass");
++    if (win == 0 && p0 + T >= 4096 && ink_b70::supported(g->dev)) {
++        ink_prompt::run(g->q, q, (const half*) kc, (const half*) vc, r, relb, E, R, sink, T, Hq, Hkv, cap, p0, out);
++        return 0;
++    }
+     attn_flash(g->q, q, (const half*) kc, (const half*) vc, r, relb, E, R, sink, T, Hq, Hkv, cap, p0, win, out);
+     return 0;
+     NS_CATCH
+diff --git a/kernels/llm/inkling2/silo/pattn_esimd.hpp b/kernels/llm/inkling2/silo/pattn_esimd.hpp
+new file mode 100644
+index 0000000..9f60ad0
+--- /dev/null
++++ b/kernels/llm/inkling2/silo/pattn_esimd.hpp
+@@ -0,0 +1,107 @@
++// Streaming prompt attention, eight query rows per Xe2 matrix tile. K is read as
++// transposed pairs and V with the 2D VNNI transform. Both come directly from the
++// FP16 cache. The relative bias, causal mask, sink and running sums use FP32.
++#pragma once
++#include <sycl/ext/intel/esimd.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++namespace ink_prompt {
++namespace es = sycl::ext::intel::esimd;
++namespace xmx = es::xmx;
++using half = sycl::half;
++constexpr int D = 128, M = 8, N = 16, WG = 8;
++constexpr float log2e = 1.4426950408889634f;
++void run(sycl::queue& queue, const float* q, const half* kc, const half* vc, const float* relq, const float* rb, int64_t E, int64_t R,
++         const float* sink, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0, float* out) {
++    int rows = T, heads = Hq, pos0 = p0, extent = E, rel = R, per = Hq / Hkv, blocks = (rows + M - 1) / M, jobs = blocks * heads;
++    int pitch = heads * D * sizeof(float), end = pos0 + rows;
++    const float qscale = 1.f / sycl::sqrt(float(D)) * log2e;
++    auto props = sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<256>};
++    queue.parallel_for(sycl::nd_range<1>(size_t((jobs + WG - 1) / WG) * WG, WG), props, [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
++        int id = it.get_global_linear_id();
++        if (id >= jobs)
++            return;
++        int hk = id / (per * blocks), h = hk * per + id % per, row0 = ((id / per) % blocks) * M;
++        const half* kb = kc + size_t(hk) * cap * D;
++        const half* vb = vc + size_t(hk) * cap * D;
++        es::simd<half, M * N> qa[D / N];
++        es::simd<float, M * N> accum[D / N];
++#pragma unroll
++        for (int d = 0; d < D; d += N) {
++            auto f = es::load_2d<float, N, M>(q + h * D, D * 4 - 1, rows - 1, pitch - 1, d, row0);
++            qa[d / N] = f * qscale;
++            accum[d / N] = 0.f;
++        }
++        float maxrow[M], sumrow[M];
++#pragma unroll
++        for (int r = 0; r < M; ++r) {
++            int at = (row0 + r < rows ? row0 + r : rows - 1);
++            maxrow[r] = sink[at * heads + h] * log2e;
++            sumrow[r] = 1.f;
++        }
++        const int job_end = (end < pos0 + row0 + M ? end : pos0 + row0 + M);
++        for (int j = 0; j < job_end; j += N) {
++            es::simd<float, M * N> sc0(0.f), sc1(0.f);
++#pragma unroll
++            for (int d = 0; d < D; d += N) {
++                auto words =
++                    es::load_2d<uint32_t, 8, 16, 1, true>(reinterpret_cast<const uint32_t*>(kb), D * 2 - 1, end - 1, D * 2 - 1, d / 2, j);
++                es::simd<half, N * N> k = words.template bit_cast_view<half>();
++                if (d < D / 2)
++                    sc0 = xmx::dpas<8, 8, float, float, half, half>(sc0, k, qa[d / N]);
++                else
++                    sc1 = xmx::dpas<8, 8, float, float, half, half>(sc1, k, qa[d / N]);
++            }
++            auto score = sc0 + sc1;
++            es::simd<half, M * N> p;
++            float factor[M];
++#pragma unroll
++            for (int r = 0; r < M; ++r) {
++                int row = (row0 + r < rows ? row0 + r : rows - 1), pos = pos0 + row;
++                es::simd<float, N> z = score.template select<N, 1>(r * N);
++                if (j + N > pos0 + row0 - extent) {
++                    es::simd<int, N> dist(pos - j, -1);
++                    es::simd_mask<N> valid = (dist >= 0) & (dist < extent);
++                    es::simd<float, N> bsum(0.f);
++                    for (int i = 0; i < rel; ++i) {
++                        auto b = es::gather<float, N>(rb, es::simd<uint32_t, N>((dist * rel + i) * 4), valid);
++                        b.merge(0.f, !valid);
++                        bsum += b * (relq[(row * heads + h) * rel + i] * log2e);
++                    }
++                    z += bsum;
++                    z.merge(-INFINITY, dist < 0);
++                }
++                float tile_max = es::hmax<float>(z);
++                float mn = maxrow[r] > tile_max ? maxrow[r] : tile_max;
++                factor[r] = es::exp2(maxrow[r] - mn);
++                auto y = es::exp2(z - mn);
++                es::simd<float, 4> lane_sums(0.f);
++#pragma unroll
++                for (int i = 0; i < 4; ++i)
++                    lane_sums += y.template select<4, 4>(i);
++                const float left = lane_sums[0] + lane_sums[1], right = lane_sums[2] + lane_sums[3];
++                sumrow[r] = sumrow[r] * factor[r] + (left + right);
++                maxrow[r] = mn;
++                p.template select<N, 1>(r * N) = es::simd<half, N>(y);
++            }
++#pragma unroll
++            for (int d = 0; d < D; d += N) {
++#pragma unroll
++                for (int r = 0; r < M; ++r)
++                    accum[d / N].template select<N, 1>(r * N) *= factor[r];
++                auto v = es::load_2d<half, N, N, 1, false, true>(vb, D * 2 - 1, end - 1, D * 2 - 1, d, j);
++                accum[d / N] = xmx::dpas<8, 8, float, float, half, half>(accum[d / N], v, p);
++            }
++        }
++#pragma unroll
++        for (int d = 0; d < D; d += N) {
++#pragma unroll
++            for (int r = 0; r < M; ++r)
++                if (row0 + r < rows) {
++                    es::simd<float, N> z = accum[d / N].template select<N, 1>(r * N);
++                    es::block_store<float, N>(out + ((row0 + r) * heads + h) * D + d, es::div_ieee(z, es::simd<float, N>(sumrow[r])));
++                }
++        }
++    });
++}
++} // namespace ink_prompt
+diff --git a/kernels/llm/inkling2/silo/silo.h b/kernels/llm/inkling2/silo/silo.h
+index 3825526..f2e1e12 100644
+--- a/kernels/llm/inkling2/silo/silo.h
++++ b/kernels/llm/inkling2/silo/silo.h
+@@ -151,6 +151,8 @@ int ns_ink2s_post_qkv(ns_gpu* g, const Ink2sQkv* p);
+ /* the decode attention's splits (part: the base kernel's layout) merged in order with the sink, times sigmoid(gate),
+  * into out [T, Hq x 128] and its quantized rows xq */
+ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, const float* gate, float* out, void* xq, int64_t T, int64_t Hq, int64_t ns);
++/* Optional long-context merge; scratch holds T * Hq * (ns + 1) floats. */
++int ns_ink2s_merge_exact(ns_gpu* g, const float* part, const float* sink, const float* gate, float* out, void* xq, int64_t T, int64_t Hq, int64_t ns, float* scratch);
+ /* (sink null: none; gate null: not gated) */
+ /* a loop controller: u [T, rank] = down [rank, 2C] . [rms(cur) | rms(msg)] (eps), then out [T, C] = cur - tanh(forget .
+  * u) cur + tanh(gain . u) msg (gain, forget [C, rank]; rank at most 64) */
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index 7d31219..d79b537 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -266,6 +266,8 @@ pub struct Session {
+     ds: Option<dspark::DsState>,
+     // A weak reference so clearing the prompt cache releases its host memory.
+     anchor: std::cell::RefCell<Option<Anchor>>,
++    /// Exclusive end of all committed and speculative cache writes since the anchor.
++    dirty_end: std::cell::Cell<usize>,
+ }
+ 
+ /// A conversation's state in host memory: per slot its keys / values still seen, then its convolution state
+@@ -654,6 +656,21 @@ impl<'g> Inkling2<'g> {
+                       union: std::env::var("NS_INK2_UNION").is_ok_and(|v| v == "1").then(|| Mutex::new(Default::default())), ds, drafts, feats })
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
++    fn merge_attention(&self, name: &'static str, fused: &ffi::Fused, part: &DevBuf, sink: Option<&DevBuf>, gate: Option<&DevBuf>,
++                       out: &DevBuf, quant: &DevBuf, rows: usize, heads: usize, splits: usize) -> Result<()> {
++        let sink = sink.map_or(std::ptr::null(), |b| b.fp());
++        let gate = gate.map_or(std::ptr::null(), |b| b.fp());
++        if let Some(merge) = fused.merge_exact.filter(|_| (128..=4096).contains(&splits)) {
++            let scratch = self.f32(rows * heads * (splits + 1))?;
++            // SAFETY: one coefficient per split and one denominator per row and head.
++            return self.op(name, || unsafe { merge(self.raw(), part.fp(), sink, gate, out.fp(), quant.ptr(),
++                                                   rows as i64, heads as i64, splits as i64, scratch.fp()) });
++        }
++        // SAFETY: the same layout without scratch, also used by older silos.
++        self.op(name, || unsafe { (fused.merge_gate_xq)(self.raw(), part.fp(), sink, gate, out.fp(), quant.ptr(), rows as i64, heads as i64, splits as i64) })
++    }
++
+     /// A kernel call, its return code checked (NS_INK2_PROFILE=1: timed, the queue drained before and after)
+     fn op(&self, name: &'static str, f: impl FnOnce() -> c_int) -> Result<()> {
+         let Some(p) = &self.prof else { return ffi::check(f(), name) };
+@@ -1432,8 +1449,8 @@ impl<'g> Inkling2<'g> {
+         unsafe {
+             self.op("attention silo", || (f.attn_part)(self.raw(), q.fp(), ss.kc.ptr(), ss.vc.ptr(), r.fp(), ly.rel_bias.fp(), extent, g.rel_len as i64, part.fp(),
+                                                        t as i64, hq as i64, hk as i64, ss.cap as i64, p0 as i64, win, 1.0 / (hd as f32).sqrt()))?;
+-            self.op("merge silo", || (f.merge_gate_xq)(self.raw(), part.fp(), sink.fp(), gate.fp(), att.fp(), aq.ptr(), t as i64, hq as i64, ns as i64))?;
+         }
++        self.merge_attention("merge silo", f, &part, Some(&sink), Some(&gate), &att, &aq, t, hq, ns)?;
+         let o = self.mmq(&ly.o, &att, Some(&aq), t)?;
+         // its convolution and the residual (a block's first layer: the stream starts again, the old one joins the blocks)
+         let (ast, asn) = self.conv_bufs(ss, 2, t)?;
+@@ -1503,6 +1520,7 @@ impl<'g> Inkling2<'g> {
+         }
+         self.arena.reset();
+         let p0 = s.pos;
++        s.dirty_end.set(s.dirty_end.get().max(p0 + t));
+         let c = g.n_embd;
+         let tc = t * c * 4;
+         let emb = self.embed(tokens)?;
+@@ -1664,7 +1682,7 @@ impl<'g> Inkling2<'g> {
+         }
+         let ds = self.ds_state(max_ctx)?;
+         self.gpu.sync()?;
+-        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0, ds, anchor: Default::default() })
++        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0, ds, anchor: Default::default(), dirty_end: Default::default() })
+     }
+ 
+     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
+@@ -1849,6 +1867,7 @@ impl<'g> Inkling2<'g> {
+         let bytes = bufs.iter().map(BufferImage::held).sum();
+         let bufs = Arc::new(bufs);
+         s.anchor.replace(Some((s.pos, Arc::downgrade(&bufs))));
++        s.dirty_end.set(s.pos);
+         Ok(Checkpoint { pos: s.pos, bufs, bytes })
+     }
+ 
+@@ -1872,7 +1891,7 @@ impl<'g> Inkling2<'g> {
+             let from = Self::kept(win, ck.pos);
+             for c in [&st.kc, &st.vc] {
+                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+-                restore_ring(c, st.cap, g.heads_kv, row, from, ck.pos, b, resident && win == 0)?;
++                restore_ring(c, st.cap, g.heads_kv, row, from, ck.pos, b, if resident { s.dirty_end.get().saturating_sub(st.cap).clamp(from, ck.pos) } else { ck.pos })?;
+             }
+             let cb = it.next().ok_or_else(|| e("a short checkpoint"))?.bytes()?;
+             if cb.len() != st.conv.len {
+@@ -1881,9 +1900,10 @@ impl<'g> Inkling2<'g> {
+             st.conv.write(0, cb)?;
+         }
+         if let Some(ds) = s.ds.as_mut() {
+-            self.ds_restore(ds, ck.pos, it.as_slice(), resident)?;
++            self.ds_restore(ds, ck.pos, it.as_slice(), resident.then_some(s.dirty_end.get()))?;
+         }
+         s.anchor.replace(Some((ck.pos, weak)));
++        s.dirty_end.set(ck.pos);
+         s.pos = ck.pos;
+         s.last_rows = 0;
+         Ok(())
+diff --git a/llm/inkling2/src/engine/checkpoint.rs b/llm/inkling2/src/engine/checkpoint.rs
+index 4613f28..cb1e1aa 100644
+--- a/llm/inkling2/src/engine/checkpoint.rs
++++ b/llm/inkling2/src/engine/checkpoint.rs
+@@ -147,7 +147,7 @@ pub(super) fn restore_ring(
+     from: usize,
+     end: usize,
+     b: &BufferImage,
+-    resident: bool,
++    restore_end: usize,
+ ) -> Result<()> {
+     if b.len() != heads * (end - from) * row {
+         return Err(e("a checkpoint of another shape"));
+@@ -157,9 +157,10 @@ pub(super) fn restore_ring(
+             return Err(e("a checkpoint of another shape"));
+         }
+     }
+-    if !resident {
++    if from < restore_end {
+         for h in 0..heads {
+             b.head(h, heads, row, from, end, |mut p, mut data| -> Result<()> {
++                data = &data[..data.len().min(restore_end.saturating_sub(p) * row)];
+                 while !data.is_empty() {
+                     let slot = p % cap;
+                     let n = (data.len() / row).min(cap - slot);
+diff --git a/llm/inkling2/src/engine/dspark.rs b/llm/inkling2/src/engine/dspark.rs
+index a68a3a9..04596d7 100644
+--- a/llm/inkling2/src/engine/dspark.rs
++++ b/llm/inkling2/src/engine/dspark.rs
+@@ -330,7 +330,7 @@ impl Inkling2<'_> {
+         Ok(bufs)
+     }
+ 
+-    pub(super) fn ds_restore(&self, st: &mut DsState, pos: usize, bufs: &[BufferImage], resident: bool) -> Result<()> {
++    pub(super) fn ds_restore(&self, st: &mut DsState, pos: usize, bufs: &[BufferImage], dirty_end: Option<usize>) -> Result<()> {
+         let Some(d) = &self.ds else { return Ok(()) };
+         let row = self.g.head * 2;
+         let mut it = bufs.iter();
+@@ -338,7 +338,7 @@ impl Inkling2<'_> {
+             let from = Self::kept(dl.win, pos);
+             for c in [kc, vc] {
+                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+-                restore_ring(c, *cp, d.heads_kv, row, from, pos, b, resident && dl.win == 0)?;
++                restore_ring(c, *cp, d.heads_kv, row, from, pos, b, dirty_end.map_or(pos, |high| high.saturating_sub(*cp).clamp(from, pos)))?;
+             }
+         }
+         let fb = it.next().ok_or_else(|| e("a short checkpoint"))?.bytes()?;
+@@ -414,6 +414,7 @@ impl Inkling2<'_> {
+         }
+         let (g, dk) = (&self.g, &sl.draft);
+         let (c, rows, p0) = (g.n_embd, nd + 1, s.pos);
++        s.dirty_end.set(s.dirty_end.get().max(p0 + rows));
+         let (qd, kd) = (d.heads * g.head, d.heads_kv * g.head);
+         self.arena.reset();
+         // the block: the tail's normed embedding, then the mask's rows
+@@ -447,9 +448,8 @@ impl Inkling2<'_> {
+                                                                kc.ptr(), vc.ptr()))?;
+                 self.op("draft attention", || (dk.attn_part_block)(self.raw(), q.fp(), kc.ptr(), vc.ptr(), part.fp(), rows as i64, d.heads as i64, d.heads_kv as i64,
+                                                                     *cp as i64, p0 as i64, dl.win as i64, 1.0 / (g.head as f32).sqrt()))?;
+-                self.op("draft merge", || (sl.fused.merge_gate_xq)(self.raw(), part.fp(), std::ptr::null(), std::ptr::null(), att.fp(), aq.ptr(), rows as i64,
+-                                                                    d.heads as i64, ns as i64))?;
+             }
++            self.merge_attention("draft merge", &sl.fused, &part, None, None, &att, &aq, rows, d.heads, ns)?;
+             let _ = kd;
+             let o = self.mmq(&dl.o, &att, Some(&aq), rows)?;
+             // SAFETY: rows x c floats each.
+diff --git a/llm/inkling2/src/ffi.rs b/llm/inkling2/src/ffi.rs
+index 3bbca69..81b6ad7 100644
+--- a/llm/inkling2/src/ffi.rs
++++ b/llm/inkling2/src/ffi.rs
+@@ -205,6 +205,7 @@ pub struct Fused {
+     pub post_qkv: unsafe extern "C" fn(G, *const Qkv) -> c_int,
+     /// (part, sink, gate, out, xq, T, Hq, ns)
+     pub merge_gate_xq: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64) -> c_int,
++    pub merge_exact: Option<unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64, *mut f32) -> c_int>,
+     /// (cur, msg, down, u, T, C, rank, eps)
+     pub ctrl_down: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
+     /// (n, cur[], msg[], down[], u[], T, C, rank, eps)
+@@ -332,6 +333,12 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+                 conv_res: sym!("ns_ink2s_conv_res"),
+                 post_qkv: sym!("ns_ink2s_post_qkv"),
+                 merge_gate_xq: sym!("ns_ink2s_merge_gate_xq"),
++                merge_exact: {
++                    let ptr = lib.symbol("ns_ink2s_merge_exact");
++                    // SAFETY: optional entry point with the signature declared in silo.h.
++                    #[allow(clippy::missing_transmute_annotations)]
++                    (!ptr.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, _>(ptr) })
++                },
+                 ctrl_down: sym!("ns_ink2s_ctrl_down"),
+                 ctrl_down_many: sym!("ns_ink2s_ctrl_down_many"),
+                 ctrl_apply_many: sym!("ns_ink2s_ctrl_apply_many"),
