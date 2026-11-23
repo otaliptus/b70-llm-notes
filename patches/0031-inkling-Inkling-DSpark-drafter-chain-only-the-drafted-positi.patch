@@ -1,0 +1,251 @@
+From 3340c467696816577db299f5ae104696c8beb42e Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:33:18 +0000
+Subject: [PATCH 13/13] Inkling DSpark drafter: chain only the drafted
+ positions, fold the backbone logits into one lm-head pass, plain argmax
+
+The markov-head chain ran all 7 block positions with two 492 MB lm-head passes each (backbone logits + bias)
+and a pool_1d "first maximum" that the SYCL backend runs in a single work-item over the 200k vocabulary: ~37 ms
+per draft step on the B70. Now: LLAMA_DSPARK_NCHAIN (set by the speculative driver to --spec-draft-n-max) limits
+the chain, LLAMA_DSPARK_FOLD=1 computes output . (backbone row + correction) in one pass (default off in this
+tree, on in the master port), LLAMA_DSPARK_ARGMAX=0 restores the old tie construction. SYCL argmax breaks ties to
+the lowest column. LLAMA_SPEC_TIMING=N prints host time of inject / draft / step. Draft step 2.5 ms at n-max 1.
+Original Inkling NVFP4-Q8_0: none 57.9, n-max 1 61.0, n-max 2 64.5 tok/s (was 18-22).
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp           | 58 +++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp |  7 +++-
+ src/models/dspark.cpp            | 67 +++++++++++++++++++++++++++-----
+ 3 files changed, 120 insertions(+), 12 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index d4a7225..8cb99eb 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,5 +1,7 @@
+ #include "speculative.h"
+ 
++#include <chrono>
++
+ #include "common.h"
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+@@ -1432,6 +1434,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+             rnn_seed.assign(n_seq, -1);
+         }
+ 
++        if (has_rnn_context && this->params.n_max > 0) {
++            // the Inkling2 graph runs the recurrent head only for the drafted positions (models/dspark.cpp)
++            setenv("LLAMA_DSPARK_NCHAIN", std::to_string(this->params.n_max).c_str(), 0);
++        }
++
+         LOG_INF("%s: - sample_from_anchor=%s, markov_rank=%d\n", __func__, sample_from_anchor ? "true" : "false", markov_rank);
+ 
+         // anchor-first DSpark yields a full block_size draft tokens
+@@ -3609,6 +3616,27 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
+     }
+ }
+ 
++// LLAMA_SPEC_TIMING=N (local profiling aid): every N drafts print the mean host time of process() (target
++// feature injection into the drafter), draft() and the whole period between two drafts (= one speculative step)
++struct spec_timing {
++    int every = -1;
++    double t_proc = 0, t_draft = 0, t_period = 0;
++    long n_proc = 0, n_draft = 0;
++    std::chrono::steady_clock::time_point last_draft{};
++    bool have_last = false;
++    bool on() {
++        if (every < 0) {
++            const char * e = getenv("LLAMA_SPEC_TIMING");
++            every = e ? atoi(e) : 0;
++        }
++        return every > 0;
++    }
++};
++static spec_timing g_spec_timing;
++static double spec_ms_since(std::chrono::steady_clock::time_point t0) {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++}
++
+ bool common_speculative_process(common_speculative * spec, const common_batch & batch) {
+     bool result = true;
+ 
+@@ -3616,9 +3644,15 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+         return result;
+     }
+ 
++    const bool timing = g_spec_timing.on();
++    const auto t0 = std::chrono::steady_clock::now();
+     for (auto & impl : spec->impls) {
+         result = result && impl->process(batch);
+     }
++    if (timing) {
++        g_spec_timing.t_proc += spec_ms_since(t0);
++        g_spec_timing.n_proc++;
++    }
+ 
+     return result;
+ }
+@@ -3627,6 +3661,30 @@ void common_speculative_draft(common_speculative * spec) {
+     if (spec == nullptr) {
+         return;
+     }
++    const bool timing = g_spec_timing.on();
++    const auto t_draft0 = std::chrono::steady_clock::now();
++    if (timing) {
++        if (g_spec_timing.have_last) {
++            g_spec_timing.t_period += std::chrono::duration<double, std::milli>(t_draft0 - g_spec_timing.last_draft).count();
++        }
++        g_spec_timing.have_last = true;
++        g_spec_timing.last_draft = t_draft0;
++    }
++    struct draft_timer {
++        bool on; std::chrono::steady_clock::time_point t0;
++        ~draft_timer() {
++            if (!on) {
++                return;
++            }
++            auto & g = g_spec_timing;
++            g.t_draft += spec_ms_since(t0);
++            if (++g.n_draft % g.every == 0) {
++                LOG_INF("spec timing: %ld drafts: process %.2f ms (%ld), draft %.2f ms, period %.2f ms\n", g.n_draft,
++                        g.n_proc ? g.t_proc / g.n_proc : 0.0, g.n_proc, g.t_draft / g.n_draft, g.t_period / std::max(1L, g.n_draft - 1));
++                g.t_proc = g.t_draft = g.t_period = 0; g.n_proc = 0; g.n_draft = 0; g.have_last = false;
++            }
++        }
++    } dtimer{timing, t_draft0};
+ 
+     auto & dparams = spec->dparams;
+ 
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index d23bac2..5bd2e8d 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3125,9 +3125,12 @@ static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
+                     if (tid < stride) {
+                         float val1 = shared_data[tid];
+                         float val2 = shared_data[tid + stride];
+-                        if (val2 > val1) {
++                        const int idx1 = shared_indices[tid];
++                        const int idx2 = shared_indices[tid + stride];
++                        // ties go to the lower column (first maximum, as on the CPU); -1 = no column seen
++                        if (val2 > val1 || (val2 == val1 && (unsigned) idx2 < (unsigned) idx1)) {
+                             shared_data[tid] = val2;
+-                            shared_indices[tid] = shared_indices[tid + stride];
++                            shared_indices[tid] = idx2;
+                         }
+                     }
+                     item_ct1.barrier(sycl::access::fence_space::local_space);
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index c79cd32..ee2a787 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -943,8 +943,11 @@ llama_model_dflash::graph_mistral_large4::graph_mistral_large4(const llm_graph_p
+     }
+ }
+ 
++// fold != nullptr: base is not given; the logits are output . (fold + correction) in one pass over the output head
++// (fold = the backbone row whose output-head product is base), instead of base + output . correction.
+ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
+-        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context) {
++        ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context,
++        ggml_tensor * fold = nullptr, int64_t n_logits = 0) {
+     auto * ctx0 = g.ctx0;
+     const int64_t rank = model.hparams.dspark_markov_rank;
+     auto * joint = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
+@@ -958,12 +961,16 @@ static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_mode
+     state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
+     auto * latent = ggml_tanh(ctx0, chunk(2));
+     auto * correction = ggml_add(ctx0, g.build_lora_mm(model.dspark_hidden_out, latent), model.dspark_hidden_out_b);
++    if (fold) {
++        correction = ggml_add(ctx0, correction, fold);
++    }
+     auto * bias = g.build_lora_mm(target.output, correction, target.output_s);
+     ggml_prec_set_acc(bias, GGML_PREC_F32);
+-    if (bias->ne[0] != base->ne[0]) {
+-        bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, base->ne[0], bias->ne[1], bias->nb[1], 0));
++    const int64_t n_out = fold ? n_logits : base->ne[0];
++    if (bias->ne[0] != n_out) {
++        bias = ggml_cont(ctx0, ggml_view_2d(ctx0, bias, n_out, bias->ne[1], bias->nb[1], 0));
+     }
+-    auto * logits = ggml_add(ctx0, base, bias);
++    auto * logits = fold ? bias : ggml_add(ctx0, base, bias);
+     const float cap = model.hparams.f_final_logit_softcapping;
+     return ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, logits, 1.0f/cap)), cap);
+ }
+@@ -1095,24 +1102,64 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
+     }
+     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
+     auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
+-    auto * logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, base->ne[0], nb, block*base->nb[1], 0));
+     const auto column = [&](ggml_tensor * t, int64_t i) {
+         return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
+     };
++    // LLAMA_DSPARK_FOLD=1: no separate backbone logits; each chained position takes one output-head pass over
++    // (backbone row + correction), the unchained positions get zero logits (never read: they are not drafted)
++    static const bool fold = [] { const char * e = getenv("LLAMA_DSPARK_FOLD"); return e && atoi(e) != 0; }();
++    const int64_t n_lg = base ? base->ne[0] : target->output->ne[1];
++    ggml_tensor * zero_col = nullptr;
++    const auto filler = [&](int64_t i) {
++        if (!fold) {
++            return column(base, i);
++        }
++        if (!zero_col) {
++            zero_col = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_lg, nb), 0.0f);
++        }
++        return zero_col;
++    };
++    auto * logits = filler(0);
+     auto * context = column(f_rnn, 0);
+-    auto * tie_rank = ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1);
+-    tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
++    // LLAMA_DSPARK_NCHAIN (set by the speculative driver to --spec-draft-n-max): run the recurrent head only for
++    // the positions that are drafted; the rest get filler logits and a zero state (never read).
++    const char * n_chain_str = getenv("LLAMA_DSPARK_NCHAIN"); // read per build: the driver sets it after the reserve
++    const int64_t n_chain_env = n_chain_str ? (int64_t) atoi(n_chain_str) : 0;
++    const int64_t n_chain = n_chain_env > 0 ? std::min<int64_t>(n_chain_env, block - 1) : block - 1;
++    // LLAMA_DSPARK_ARGMAX=0: the old first-maximum construction (pool_1d over the vocabulary in one work-item on SYCL)
++    static const bool plain_argmax = [] { const char * e = getenv("LLAMA_DSPARK_ARGMAX"); return !e || atoi(e) != 0; }();
++    ggml_tensor * tie_rank = nullptr;
++    if (!plain_argmax) {
++        tie_rank = ggml_scale_bias(ctx0, ggml_arange(ctx0, 0, hparams.n_vocab_unpadded, 1), -1.0f, hparams.n_vocab_unpadded);
++    }
+     auto * prev = ids;
+-    for (int64_t i = 1; i < block; ++i) {
+-        auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
++    for (int64_t i = 1; i <= n_chain; ++i) {
++        auto * col = fold
++            ? build_inkling2_head(*this, model, *target, prev, state, column(cur, i), nullptr, context, column(cur, i), n_lg)
++            : build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context);
+         states = ggml_concat(ctx0, states, ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0), 1);
+         logits = ggml_concat(ctx0, logits, col, 1);
+-        // Select the first maximum, independent of backend argmax tie order.
++        if (i == n_chain) {
++            break;
++        }
+         auto * valid = ggml_cont(ctx0, ggml_view_2d(ctx0, col, hparams.n_vocab_unpadded, nb, col->nb[1], 0));
++        if (plain_argmax) {
++            // the SYCL argmax returns the first maximum (patched reduction), as the CPU one does
++            prev = ggml_argmax(ctx0, valid);
++            continue;
++        }
++        // Select the first maximum, independent of backend argmax tie order.
+         auto * maximum = ggml_pool_1d(ctx0, valid, GGML_OP_POOL_MAX, valid->ne[0], 1, 0);
+         auto * is_max = ggml_scale_bias(ctx0, ggml_step(ctx0, ggml_sub(ctx0, ggml_repeat(ctx0, maximum, valid), valid)), -1.0f, 1.0f);
+         prev = ggml_argmax(ctx0, ggml_mul(ctx0, is_max, tie_rank));
+     }
++    if (n_chain + 1 < block) {
++        auto * zstate = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb), 0.0f);
++        for (int64_t i = n_chain + 1; i < block; ++i) {
++            states = ggml_concat(ctx0, states, zstate, 1);
++            logits = ggml_concat(ctx0, logits, filler(i), 1);
++        }
++    }
+     const auto block_order = [&](ggml_tensor * t) {
+         t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
+         return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], n_tokens);
+-- 
+2.47.3
+

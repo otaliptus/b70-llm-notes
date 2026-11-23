@@ -1,0 +1,89 @@
+From 76d5b2858b50c3a41c6673c123e3481361afd0ef Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:42:34 +0000
+Subject: [PATCH 19/21] SYCL mul_mat: reuse the q8_1 quantization of a src1
+ tensor within one graph (GGML_SYCL_Q8_1_CACHE, default 1)
+
+Mat-muls of one graph that read the same src1 tensor (Inkling: k, v, q, rel, sink and gate projections of a SWA
+layer pass) quantized it once each. A per-device 512 KB buffer keyed by (tensor object, data pointer, graph-compute
+generation, quantize kind, shape) now serves the later ones; prompt-sized quantizations bypass it. Bit-exact (PPL
+at -ub 1/2/4 unchanged). Gain is small: single-token Q8_0 mat-vecs take the ESIMD path, which reads f32 and never
+quantizes, so only 2-8 token batches benefit: llama-bench pp3 @ d512 112.3 vs 111.5 tok/s, tg64 60.44 both.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 42 ++++++++++++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index fc68645..432a302 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -3672,6 +3672,25 @@ static void ggml_sycl_set_peer_access(const int n_tokens, [[maybe_unused]] int m
+     peer_access_enabled = enable_peer_access;
+ }
+ 
++// GGML_SYCL_Q8_1_CACHE (default 1): mat-muls of one graph that read the same src1 tensor quantize it to q8_1 once.
++// Inkling's attention projections (k, v, q, rel, sink, gate) share one input per layer pass: 6 quantize launches -> 1.
++// The key is the tensor object, its data pointer and the graph-compute generation (ggml-alloc reuses addresses for
++// later tensors, and the same tensor object carries new data in the next compute). The buffer is fixed per device
++// (also safe under SYCL graph replay); larger quantizations (prompt batches) bypass the cache.
++static constexpr size_t SYCL_Q81_CACHE_BYTES = 512 * 1024;
++static uint64_t g_sycl_graph_gen = 0;
++struct sycl_q81_cache {
++    const ggml_tensor * t      = nullptr;
++    const void *        data   = nullptr;
++    uint64_t            gen    = 0;
++    int                 kind   = -1;
++    int64_t             ne10   = 0;
++    int64_t             nrows  = 0;
++    int64_t             padded = 0;
++    char *              buf    = nullptr;
++};
++static sycl_q81_cache g_sycl_q81_cache[GGML_SYCL_MAX_DEVICES];
++
+ template <template <int> typename quantize_f>
+ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+                                  const ggml_tensor *src1, ggml_tensor *dst,
+@@ -3797,9 +3816,27 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+         }
+ 
+         if constexpr(quantize_enabled) {
+-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
++            static const bool q81_cache_on = ggml_sycl_get_env("GGML_SYCL_Q8_1_CACHE", 1) != 0;
++            constexpr int q81_kind = std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>, quantize_q8_1<QK8_1 / WARP_SIZE>> ? 0 : 1;
++            const size_t q81_bytes = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
++            auto & qc = g_sycl_q81_cache[i];
++            const bool q81_cacheable = q81_cache_on && !split && src1_on_device && src1_is_contiguous && q81_bytes <= SYCL_Q81_CACHE_BYTES;
++            const bool q81_hit = q81_cacheable && qc.t == src1 && qc.data == src1->data && qc.gen == g_sycl_graph_gen &&
++                                 qc.kind == q81_kind && qc.ne10 == ne10 && qc.nrows == nrows1 && qc.padded == src1_padded_col_size;
++            if (q81_cacheable) {
++                if (!qc.buf) {
++                    qc.buf = (char *) sycl::malloc_device(SYCL_Q81_CACHE_BYTES, *stream);
++                }
++                dev[i].src1_ddq = qc.buf;
++            } else {
++                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), q81_bytes);
++            }
+ 
+-            if (src1_on_device && src1_is_contiguous) {
++            if (src1_on_device && src1_is_contiguous && !q81_hit) {
++                if (q81_cacheable) {
++                    qc.t = src1; qc.data = src1->data; qc.gen = g_sycl_graph_gen; qc.kind = q81_kind;
++                    qc.ne10 = ne10; qc.nrows = nrows1; qc.padded = src1_padded_col_size;
++                }
+                 scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                      /*num_src=*/2, " : converting src1 to Q8_1");
+                 try {
+@@ -7282,6 +7319,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+ #endif
+ 
+ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
++    g_sycl_graph_gen++;  // invalidates the q8_1 src1 cache (GGML_SYCL_Q8_1_CACHE)
+     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+ 
+     // set the device on every call: a graph replay does not go through
+-- 
+2.47.3
+

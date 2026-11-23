@@ -1,0 +1,48 @@
+From 3bbd9df8ac753e5976e043cc6689f18831f715ee Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:57:25 +0000
+Subject: [PATCH 21/21] SYCL graphs: 2-8 token MUL_MAT_ID batches no longer
+ disable graph recording
+
+ggml_sycl_mul_mat_id_needs_sync() judged multi-token batches by the generic path (host wait on the expert ids),
+so every speculative verify graph ran without SYCL graphs. Small batches take one fused MMVQ launch per token
+(GGML_SYCL_MMID_SMALL_BATCH), which never waits on the host: mirror that branch in the check.
+Uncensored AD-Q4_K, server sweep with GGML_SYCL_ENABLE_GRAPH=1: no drafter 59.3 -> 61.2 tok/s; DSpark n-max 2 step
+30.6 -> 29.4 ms. Temp-0 outputs identical with and without graphs; PPL -ub 2/4 unchanged.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 432a302..bfbfce1 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7190,6 +7190,22 @@ static bool ggml_sycl_mul_mat_id_needs_sync(ggml_backend_sycl_context * ctx, con
+         return reordered ? !ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
+                            !ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
+     }
++    // 2-8 token batches (speculative verify) take one fused MMVQ launch per token, no host wait: mirror the
++    // small-batch branch of ggml_sycl_mul_mat_id() so these graphs can be recorded as SYCL graphs too
++    {
++        static const int mmid_small_batch = ggml_sycl_get_env("GGML_SYCL_MMID_SMALL_BATCH", 8);
++        const int64_t ne12 = src1->ne[2];
++        if (ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12 && src1->ne[3] == 1) {
++            ggml_tensor src1_t = *src1, ids_t = *ids, dst_t = *dst;
++            src1_t.ne[2] = 1; ids_t.ne[1] = 1; dst_t.ne[2] = 1;
++            src1_t.src[0] = nullptr;
++            dst_t.src[0] = (ggml_tensor *) src0; dst_t.src[1] = &src1_t; dst_t.src[2] = &ids_t;
++            if (ggml_sycl_mul_mat_id_should_use_mmvq(&dst_t)) {
++                return reordered ? !ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type) :
++                                   !ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type);
++            }
++        }
++    }
+     return !ggml_sycl_mul_mat_id_device_sched_eligible(dst) ||
+            !ggml_sycl_grouped_dequant_gemm_device_supported(src0->type, reordered, ggml_sycl_src1_prec(dst),
+                src0->ne[2], ids->ne[0], ids->ne[1], src0->ne[1], src0->ne[0], ctx->stream());
+-- 
+2.47.3
+

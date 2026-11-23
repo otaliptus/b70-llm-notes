@@ -1,0 +1,417 @@
+From f95343e9b485fed60ca24f74801d01e882d244b4 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:32:45 +0000
+Subject: [PATCH 17/21] SYCL MUL_MAT_ID small batches: experimental
+ shared-expert kernel (GGML_SYCL_MMID_DEDUP=1, off) and GGML_SYCL_MMID_STATS
+
+- GGML_SYCL_MMID_DEDUP=1: 2-8 token batches in one launch; a planning kernel marks, per (token, slot), whether an
+  earlier token routes to the same expert, and the owner computes that expert's rows for every token using it
+  (Q4_K/Q5_K/Q6_K/Q8_0 reordered layouts, Q5_0 through local memory). Bit-identical results (PPL equal, MUL_MAT_ID
+  q4_K/q5_0/q8_0/q6_K/q5_K 242/242). Not faster: real text -ub 4 -1.6 % pass time, -ub 2 +3.5 %; default off.
+- GGML_SYCL_MMID_STATS=N (debug, host sync): distinct experts per small batch. Inkling 2 Mini uncensored on real text:
+  adjacent tokens share 3.3 of 8 experts; distinct/slots 0.79 at 2 tokens, 0.62 at 4.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp |  60 +++++++
+ ggml/src/ggml-sycl/mmvq.cpp      | 294 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/mmvq.hpp      |   7 +
+ 3 files changed, 361 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 15111ff..fc68645 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5816,10 +5816,70 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+     // GGML_SYCL_MMID_SMALL_BATCH=N (default 8, 0 = off) is the largest token count that takes this path.
+     static const int mmid_small_batch = ggml_sycl_get_env("GGML_SYCL_MMID_SMALL_BATCH", 8);
+     if (ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12 && ne13 == 1) {
++        // GGML_SYCL_MMID_STATS=N (debug, synchronizes): distinct experts per small batch vs n_used x tokens, printed every N calls
++        static const int mmid_stats = ggml_sycl_get_env("GGML_SYCL_MMID_STATS", 0);
++        if (mmid_stats > 0 && ids->type == GGML_TYPE_I32) {
++            static long n_calls[9] = {}, n_slots[9] = {}, n_unique[9] = {}, n_pair_shared[9] = {}, n_pairs[9] = {};
++            const int64_t n_used = ids->ne[0];
++            std::vector<int32_t> h((size_t) n_used * ne12);
++            for (int64_t t = 0; t < ne12; ++t) {
++                ctx.stream()->memcpy(h.data() + t * n_used, (const char *) ids->data + t * ids->nb[1], n_used * sizeof(int32_t));
++            }
++            ctx.stream()->wait();
++            std::vector<int32_t> u(h);
++            std::sort(u.begin(), u.end());
++            const long uniq = std::unique(u.begin(), u.end()) - u.begin();
++            const int k = (int) ne12;
++            n_calls[k]++; n_slots[k] += (long) h.size(); n_unique[k] += uniq;
++            for (int64_t t = 1; t < ne12; ++t) {
++                for (int64_t a = 0; a < n_used; ++a) {
++                    for (int64_t b = 0; b < n_used; ++b) {
++                        n_pair_shared[k] += h[t * n_used + a] == h[(t - 1) * n_used + b];
++                    }
++                }
++                n_pairs[k]++;
++            }
++            static long n_all = 0;
++            if (++n_all % mmid_stats == 0) {
++                for (int j = 2; j <= 8; ++j) {
++                    if (n_calls[j]) {
++                        fprintf(stderr, "MMID_STATS ne12=%d calls=%ld distinct/slots=%.3f adjacent-shared=%.2f of %lld\n", j, n_calls[j],
++                                (double) n_unique[j] / n_slots[j], (double) n_pair_shared[j] / std::max(1L, n_pairs[j]), (long long) n_used);
++                    }
++                }
++            }
++        }
+         ggml_tensor src1_t = *src1, ids_t = *ids, dst_t = *dst;
+         src1_t.ne[2] = 1; ids_t.ne[1] = 1; dst_t.ne[2] = 1;
+         src1_t.src[0] = nullptr;
+         dst_t.src[0] = (ggml_tensor *) src0; dst_t.src[1] = &src1_t; dst_t.src[2] = &ids_t;
++        // GGML_SYCL_MMID_DEDUP=1 (experimental, off): one launch for all tokens, an expert shared by several tokens is read
++        // once. Real text, Inkling AD-Q4_K: 4-token batches -1.6 % time, 2-token batches +3.5 % (the kernels are bound by
++        // dot products and activation loads, not by expert bytes), so the per-token loop stays the default.
++        static const int mmid_dedup = ggml_sycl_get_env("GGML_SYCL_MMID_DEDUP", 0);
++        if (mmid_dedup && ggml_sycl_mul_mat_id_should_use_mmvq(&dst_t) && ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
++                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && dst->nb[0] == sizeof(float)) {
++            opt_for_reorder_id(&ctx, src0);
++            const ggml_tensor_extra_gpu * src0_extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++            const bool reorder = src0_extra && src0_extra->optimized_feature.reorder;
++            if (ggml_sycl_mul_mat_vec_q_id_mt_supports(src0->type, reorder, (int) ne10, src0->nb[2], src0->data)) {
++                const int    padded         = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
++                const size_t bytes_per_qrow = (size_t) padded * sizeof(block_q8_1) / QK8_1;
++                const int    n_rows_q       = (int) (ne11 * ne12);
++                ggml_sycl_pool_alloc<char> q8(ctx.pool(), (size_t) n_rows_q * bytes_per_qrow);
++                if (reorder) {
++                    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) src1->data, q8.get(), (int) ne10, n_rows_q, padded, ctx.stream());
++                } else {
++                    quantize_row_q8_1_sycl<quantize_q8_1>((const float *) src1->data, q8.get(), (int) ne10, n_rows_q, padded, ctx.stream());
++                }
++                ggml_sycl_pool_alloc<int32_t> plan(ctx.pool(), (size_t) 3 * ids->ne[0] * ne12);
++                if (ggml_sycl_mul_mat_vec_q_id_mt(src0->type, reorder, src0->data, q8.get(), (const int32_t *) ids->data,
++                        (int) (ids->nb[1] / sizeof(int32_t)), (float *) dst->data, (int) ne10, (int) src0->ne[1], (int) ids->ne[0], (int) ne12,
++                        src0->nb[2], ne11 == 1 ? 0 : bytes_per_qrow, (size_t) ne11 * bytes_per_qrow, dst->nb[1], dst->nb[2], plan.get(), ctx.stream())) {
++                    return;
++                }
++            }
++        }
+         if (ggml_sycl_mul_mat_id_should_use_mmvq(&dst_t)) {
+             for (int64_t t = 0; t < ne12; ++t) {
+                 src1_t.data = (char *) src1->data + t * nb12;
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 7301e8e..5a1da63 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3441,3 +3441,297 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
+             return false;
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------------------------
++// Multi-token MoE mat-vec with shared experts (small batches, e.g. a speculative verify step). The slots of all
++// T tokens form the grid; the work-group of slot (t, s) with expert e returns at once when an earlier token also
++// routes to e, otherwise it computes row `row` of expert e for every token t'' >= t that uses e, reading the
++// weight row from memory once (adjacent Inkling tokens share ~3 of 8 experts). src1 row of (t, s) is at
++// t*src1_tok_stride + s*src1_row_stride (q8_1, as quantized for t*n_used rows or t rows), dst at
++// t*dst_tok_stride + s*dst_row_stride.
++static constexpr int MMID_MT_MAX_TOK = 8;
++
++struct mmid_mt_args {
++    const int32_t * plan;            // per slot: [n_match, packed (tok << 4 | slot) bytes x 8 in 2 ints], 0 = not owner
++    const void *    vx_base;
++    const void *    vy_base;
++    float *         dst_base;
++    const int32_t * ids;
++    int             ids_tok_stride;  // in int32 elements
++    int             n_used;
++    int             n_tok;
++    int             ncols;
++    int             nrows;
++    size_t          expert_weight_stride;
++    size_t          src1_row_stride;
++    size_t          src1_tok_stride;
++    size_t          dst_row_stride;
++    size_t          dst_tok_stride;
++};
++
++// ownership plan, one work-item per slot (t, s) of expert e: n_match = 0 when an earlier token also routes to e,
++// otherwise the tokens t'' >= t using e and their slots
++static void mmid_mt_plan_kernel(const int32_t * ids, int ids_tok_stride, int n_used, int n_tok, int32_t * plan, int gslot) {
++    const int t = gslot / n_used;
++    const int s = gslot % n_used;
++    const int e = ids[t * ids_tok_stride + s];
++    int32_t * rec = plan + 3 * gslot;
++    for (int t1 = 0; t1 < t; ++t1) {
++        for (int s1 = 0; s1 < n_used; ++s1) {
++            if (ids[t1 * ids_tok_stride + s1] == e) {
++                rec[0] = 0;
++                return;
++            }
++        }
++    }
++    uint32_t packed[2] = { (uint32_t) ((t << 4) | s), 0 };
++    int n = 1;
++    for (int t1 = t + 1; t1 < n_tok; ++t1) {
++        for (int s1 = 0; s1 < n_used; ++s1) {
++            if (ids[t1 * ids_tok_stride + s1] == e) {
++                packed[n >> 2] |= (uint32_t) ((t1 << 4) | s1) << (8 * (n & 3));
++                ++n;
++                break;
++            }
++        }
++    }
++    rec[0] = n;
++    rec[1] = (int32_t) packed[0];
++    rec[2] = (int32_t) packed[1];
++}
++
++// fills tok[]/slot[] from the plan; returns 0 when another work-group owns the expert
++static inline int mmid_mt_owner(const mmid_mt_args & a, int gslot, int * tok, int * slot) {
++    const int32_t * rec = a.plan + 3 * gslot;
++    const int n = rec[0];
++    if (n == 0) {
++        return 0;
++    }
++    const uint32_t p0 = (uint32_t) rec[1], p1 = (uint32_t) rec[2];
++#pragma unroll
++    for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++        const uint32_t b = ((j < 4 ? p0 : p1) >> (8 * (j & 3))) & 0xff;
++        tok[j]  = (int) (b >> 4);
++        slot[j] = (int) (b & 15);
++    }
++    return n;
++}
++
++template <typename reorder_vec_dot_q_sycl>
++static void mul_mat_vec_q_moe_reorder_mt(const mmid_mt_args a, const sycl::nd_item<3> & item_ct1) {
++    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
++    using block_traits = typename block_type::traits;
++
++    const int gslot = item_ct1.get_group(1);
++    const int t     = gslot / a.n_used;
++    const int s     = gslot % a.n_used;
++    const int e     = a.ids[t * a.ids_tok_stride + s];
++    const int row   = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
++    if (row >= a.nrows) {
++        return;
++    }
++    const auto sg = item_ct1.get_sub_group();
++    if (e == -1) {
++        if (sg.leader()) {
++            ((float *) ((char *) a.dst_base + t * a.dst_tok_stride + s * a.dst_row_stride))[row] = 0.0f;
++        }
++        return;
++    }
++    int tok[MMID_MT_MAX_TOK], slot[MMID_MT_MAX_TOK];
++    const int nm = mmid_mt_owner(a, gslot, tok, slot);
++    if (nm == 0) {
++        return;
++    }
++
++    const char * vx = (const char *) a.vx_base + (size_t) e * a.expert_weight_stride;
++    constexpr int vdr_mmvq = reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0 ? VDR_Q8_0_Q8_1_MMVQ : block_traits::vdr_mmvq;
++    const int     blocks_per_row              = a.ncols / block_traits::qk;
++    constexpr int blocks_per_subgroup         = ceil_div(vdr_mmvq * WARP_SIZE, block_traits::qi);
++    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_mmvq;
++    const int     nblocks                     = a.nrows * (a.ncols / block_traits::qk);
++
++    float partial[MMID_MT_MAX_TOK];
++#pragma unroll
++    for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++        partial[j] = 0.0f;
++    }
++    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
++        const int ibx = row * blocks_per_row + i;
++        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
++        const auto d_offset  = block_type::get_d_offset(a.nrows, a.ncols, ibx);
++        const int  iby       = i * block_type::block_to_q8_1_ratio();
++#pragma unroll
++        for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++            if (j >= nm) {
++                break;
++            }
++            const char * vy = (const char *) a.vy_base + tok[j] * a.src1_tok_stride + slot[j] * a.src1_row_stride;
++            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
++            const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + a.ncols + iby * sizeof(sycl::half2));
++#pragma unroll
++            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
++                const int iqs = elem + vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
++                if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
++                    partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs, vdr_mmvq);
++                } else {
++                    partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
++                }
++            }
++        }
++    }
++#pragma unroll
++    for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++        if (j >= nm) {
++            break;
++        }
++        float sum = partial[j];
++        if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
++            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
++                sum += dpct::permute_sub_group_by_xor(sg, sum, mask);
++            }
++        } else {
++            sum = sycl::reduce_over_group(sg, sum, std::plus<>());
++        }
++        if (sg.leader()) {
++            ((float *) ((char *) a.dst_base + tok[j] * a.dst_tok_stride + slot[j] * a.dst_row_stride))[row] = sum;
++        }
++    }
++}
++
++static void mul_mat_vec_q5_0_q8_1_moe_slm_mt(const mmid_mt_args a, uint32_t * slm_all, const sycl::nd_item<3> & item_ct1) {
++    auto sg = item_ct1.get_sub_group();
++    const int lane    = item_ct1.get_local_id(2);
++    const int r_local = item_ct1.get_local_id(1);
++    const int gslot   = item_ct1.get_group(1);
++    const int t       = gslot / a.n_used;
++    const int s       = gslot % a.n_used;
++    const int e       = a.ids[t * a.ids_tok_stride + s];
++    const int row     = item_ct1.get_group(2) * Q5_0_MOE_SLM_ROWS + r_local;
++    if (row >= a.nrows) {
++        return;
++    }
++    if (e == -1) {
++        if (lane == 0) {
++            ((float *) ((char *) a.dst_base + t * a.dst_tok_stride + s * a.dst_row_stride))[row] = 0.0f;
++        }
++        return;
++    }
++    int tok[MMID_MT_MAX_TOK], slot[MMID_MT_MAX_TOK];
++    const int nm = mmid_mt_owner(a, gslot, tok, slot);
++    if (nm == 0) {
++        return;
++    }
++    const block_q8_1 * ys[MMID_MT_MAX_TOK];
++    float tmp[MMID_MT_MAX_TOK];
++#pragma unroll
++    for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++        tmp[j] = 0.0f;
++        ys[j]  = (const block_q8_1 *) ((const char *) a.vy_base + (j < nm ? tok[j] * a.src1_tok_stride + slot[j] * a.src1_row_stride : 0));
++    }
++
++    const int blocks_per_row = a.ncols / QK5_0;
++    const uint8_t * xrow = (const uint8_t *) a.vx_base + (size_t) e * a.expert_weight_stride
++                         + (size_t) row * blocks_per_row * sizeof(block_q5_0);
++    uint32_t * slm = slm_all + r_local * (Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4);
++
++    for (int b0 = 0; b0 < blocks_per_row; b0 += Q5_0_MOE_SLM_CHUNK) {
++        const int nb  = sycl::min(Q5_0_MOE_SLM_CHUNK, blocks_per_row - b0);
++        const int ndw = nb * (int) sizeof(block_q5_0) / 4;
++        const uint32_t * src = (const uint32_t *) (xrow + (size_t) b0 * sizeof(block_q5_0));
++        for (int k = lane; k < ndw; k += WARP_SIZE) {
++            slm[k] = src[k];
++        }
++        sycl::group_barrier(sg);
++        for (int b = lane; b < nb; b += WARP_SIZE) {
++            const uint16_t * h = (const uint16_t *) ((const uint8_t *) slm + b * sizeof(block_q5_0));
++            const float d5 = (float) sycl::bit_cast<sycl::half>(h[0]);
++            const uint32_t qh = (uint32_t) h[1] | ((uint32_t) h[2] << 16);
++            int vl[4], vh[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                vl[i] = (int) ((uint32_t) h[3 + 2*i] | ((uint32_t) h[4 + 2*i] << 16));
++                vh[i] = (int) (qh >> (4 * i));
++            }
++#pragma unroll
++            for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++                if (j >= nm) {
++                    break;
++                }
++                const block_q8_1 * yb = ys[j] + b0 + b;
++                int u[8];
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    u[2*i+0] = get_int_from_int8_aligned(yb->qs, i);
++                    u[2*i+1] = get_int_from_int8_aligned(yb->qs, i + QI5_0);
++                }
++                tmp[j] += vec_dot_q5_0_q8_1_impl<4>(vl, vh, u, d5, yb->ds);
++            }
++        }
++        sycl::group_barrier(sg);
++    }
++#pragma unroll
++    for (int j = 0; j < MMID_MT_MAX_TOK; ++j) {
++        if (j >= nm) {
++            break;
++        }
++        const float sum = sycl::reduce_over_group(sg, tmp[j], sycl::plus<float>());
++        if (lane == 0) {
++            ((float *) ((char *) a.dst_base + tok[j] * a.dst_tok_stride + slot[j] * a.dst_row_stride))[row] = sum;
++        }
++    }
++}
++
++bool ggml_sycl_mul_mat_vec_q_id_mt_supports(enum ggml_type src0_type, bool reorder, int ncols, size_t expert_weight_stride, const void * vx) {
++    if (reorder) {
++        return src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q6_K || src0_type == GGML_TYPE_Q5_K;
++    }
++    return src0_type == GGML_TYPE_Q5_0 && ggml_sycl_get_env("GGML_SYCL_Q5_0_MOE_SLM", 1) != 0 &&
++           (ncols / QK5_0) % 2 == 0 && expert_weight_stride % 4 == 0 && ((uintptr_t) vx) % 4 == 0;
++}
++
++bool ggml_sycl_mul_mat_vec_q_id_mt(enum ggml_type src0_type, bool reorder, const void * vx_base, const void * vy,
++        const int32_t * ids, int ids_tok_stride, float * dst_base, int ncols, int nrows, int n_used, int n_tok,
++        size_t expert_weight_stride, size_t src1_row_stride, size_t src1_tok_stride, size_t dst_row_stride,
++        size_t dst_tok_stride, int32_t * plan, dpct::queue_ptr stream) {
++    if (n_tok < 1 || n_tok > MMID_MT_MAX_TOK || n_used > 16 || !ggml_sycl_mul_mat_vec_q_id_mt_supports(src0_type, reorder, ncols, expert_weight_stride, vx_base)) {
++        return false;
++    }
++    const unsigned n_slots = (unsigned) (n_used * n_tok);
++    stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(n_slots), sycl::range<1>(n_slots)), [=](sycl::nd_item<1> it) {
++        mmid_mt_plan_kernel(ids, ids_tok_stride, n_used, n_tok, plan, (int) it.get_global_id(0));
++    });
++    const mmid_mt_args a = { plan, vx_base, vy, dst_base, ids, ids_tok_stride, n_used, n_tok, ncols, nrows,
++                             expert_weight_stride, src1_row_stride, src1_tok_stride, dst_row_stride, dst_tok_stride };
++    if (!reorder) {
++        const int            block_num_y = (nrows + Q5_0_MOE_SLM_ROWS - 1) / Q5_0_MOE_SLM_ROWS;
++        const sycl::range<3> block_nums(1, n_slots, (unsigned) block_num_y);
++        const sycl::range<3> block_dims(1, Q5_0_MOE_SLM_ROWS, WARP_SIZE);
++        stream->submit([&](sycl::handler & cgh) {
++            sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(Q5_0_MOE_SLM_ROWS * Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4), cgh);
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    mul_mat_vec_q5_0_q8_1_moe_slm_mt(a, slm.get_multi_ptr<sycl::access::decorated::no>().get(), item);
++                });
++        });
++        return true;
++    }
++    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
++    const sycl::range<3> block_nums(1, n_slots, (unsigned) block_num_y);
++    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
++    auto launch = [&](auto vd) {
++        using VD = decltype(vd);
++        stream->submit([&](sycl::handler & cgh) {
++            cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
++                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                    mul_mat_vec_q_moe_reorder_mt<VD>(a, item);
++                });
++        });
++    };
++    switch (src0_type) {
++        case GGML_TYPE_Q4_K: launch(reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>()); return true;
++        case GGML_TYPE_Q5_K: launch(reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>()); return true;
++        case GGML_TYPE_Q6_K: launch(reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>()); return true;
++        case GGML_TYPE_Q8_0: launch(reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>()); return true;
++        default: return false;
++    }
++}
+diff --git a/ggml/src/ggml-sycl/mmvq.hpp b/ggml/src/ggml-sycl/mmvq.hpp
+index e372d50..584712e 100644
+--- a/ggml/src/ggml-sycl/mmvq.hpp
++++ b/ggml/src/ggml-sycl/mmvq.hpp
+@@ -120,4 +120,11 @@ bool ggml_sycl_mul_mat_vec_q_glu_plain(
+ bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
+ bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type);
+ 
++// multi-token MoE mat-vec, each shared expert read once for all tokens using it (small batches)
++bool ggml_sycl_mul_mat_vec_q_id_mt_supports(enum ggml_type src0_type, bool reorder, int ncols, size_t expert_weight_stride, const void * vx);
++bool ggml_sycl_mul_mat_vec_q_id_mt(enum ggml_type src0_type, bool reorder, const void * vx_base, const void * vy,
++        const int32_t * ids, int ids_tok_stride, float * dst_base, int ncols, int nrows, int n_used, int n_tok,
++        size_t expert_weight_stride, size_t src1_row_stride, size_t src1_tok_stride, size_t dst_row_stride,
++        size_t dst_tok_stride, int32_t * plan /* 3 x n_used x n_tok ints of device scratch */, dpct::queue_ptr stream);
++
+ #endif // GGML_SYCL_MMVQ_HPP
+-- 
+2.47.3
+

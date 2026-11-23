@@ -1,0 +1,66 @@
+From 3921645174eb13a8883bf6306c42a0036c560259 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 03:41:49 +0000
+Subject: [PATCH 04/13] SYCL NVFP4: SWAR E2M1 decode in vec_dot_nvfp4_q8_1 and
+ bit-built UE4M3 scales instead of sycl::pow
+
+MoE decode gate_up 161 -> 50 us, down 96 -> 28 us (test-backend-ops, 8 of 128 experts); Inkling 2 Mini tg64 28.3 -> 37.5.
+UE4M3 decode checked against the pow version for all 128 codes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/common.hpp  | 21 ++++++++-------------
+ ggml/src/ggml-sycl/vecdotq.hpp |  4 ++--
+ 2 files changed, 10 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index ae156ac..b2a0162 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -1189,19 +1189,14 @@ static T block_reduce(T val, T * shared_vals, int block_size_template) {
+ 
+ static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
+     // UE4M3 is unsigned: 4 exp bits (bias 7), 3 mantissa bits, no sign, no NaN.
+-    // exp == 0xF is a valid exponent (256-448 range), not NaN.
+-    if (x == 0 || x == 0x7F) {
+-        return 0.0f;
+-    }
+-    const int exp = (x >> 3) & 0xF;
+-    const int man = x & 0x7;
+-    float raw;
+-    if (exp == 0) {
+-        raw = man * (1.0f / 8.0f) * sycl::pow(2.0f, -6.0f);
+-    } else {
+-        raw = (1.0f + man / 8.0f) * sycl::pow(2.0f, (float) exp - 7.0f);
+-    }
+-    return raw * 0.5f;
++    // exp == 0xF is a valid exponent (256-448 range), not NaN. Returns half the value (the E2M1 table is doubled).
++    // Bit construction instead of sycl::pow: a normal code is the float with exponent field exp + 127 - 7 - 1 and
++    // mantissa man << 20; a subnormal (exp == 0) is man * 2^-9 * 0.5. Same results as the pow version.
++    const uint32_t bits = ((uint32_t) (x & 0x7F) << 20) + (119u << 23);
++    const float    nrm  = sycl::bit_cast<float>(bits);
++    const float    sub  = (float) (x & 0x7) * (1.0f / 1024.0f);
++    const float    v    = (x & 0x78) ? nrm : sub;
++    return x == 0x7F ? 0.0f : v;
+ }
+ 
+ #endif // GGML_SYCL_COMMON_HPP
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index f2f3466..2da7e25 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -1212,8 +1212,8 @@ static __dpct_inline__ float vec_dot_nvfp4_q8_1(const void * __restrict__ vbq,
+         const int32_t iqs0 = iqs + 2*i;
+         const int32_t iqs1 = iqs0 + 1;
+         const int32_t is = iqs0 >> 1;
+-        const sycl::int2   v0   = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_mxfp4);
+-        const sycl::int2   v1   = get_int_from_table_16(get_int_b4(bq4->qs, iqs1), kvalues_mxfp4);
++        const sycl::int2   v0   = get_int_from_mxfp4(get_int_b4(bq4->qs, iqs0));
++        const sycl::int2   v1   = get_int_from_mxfp4(get_int_b4(bq4->qs, iqs1));
+         const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+         const int32_t i8 = ((is & 1) << 2);
+ 
+-- 
+2.47.3
+

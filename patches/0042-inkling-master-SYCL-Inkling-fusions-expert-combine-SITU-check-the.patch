@@ -1,0 +1,83 @@
+From c7cab6d9c7c7a292cd668ffcdcba322d53527aec Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:42:25 +0000
+Subject: [PATCH 11/13] SYCL Inkling fusions: expert combine / SITU check the
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/inkling-fuse.cpp | 23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/inkling-fuse.cpp b/ggml/src/ggml-sycl/inkling-fuse.cpp
+index c140ab5..ad0d1f7 100644
+--- a/ggml/src/ggml-sycl/inkling-fuse.cpp
++++ b/ggml/src/ggml-sycl/inkling-fuse.cpp
+@@ -463,8 +463,8 @@ int fuse_situ(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i) {
+         ids_d = (const int32_t *) ids->data;
+         ids_nb1 = ids->nb[1] / sizeof(int32_t);
+     }
+-    if (overlaps(m2, raw)) {
+-        return 0;
++    if (overlaps(m2, raw) || (has_scale && (overlaps(m2, t[1]->src[1]) || overlaps(m2, view_root(t[1]->src[1]))))) {
++        IFUSE_REJECT("situ overlap", m2);
+     }
+     const ggml_tensor * outs[] = { m2 };
+     if (!span_ok(cg, i, last, outs, 1)) {
+@@ -514,7 +514,8 @@ int fuse_combine(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+     }
+     const ggml_tensor * wmul = cg->nodes[idx[pre]];
+     // n_tok <= 8 only: with more tokens the fused combine hangs the device (not understood yet, 2026-11-21)
+-    if (wmul->op != GGML_OP_MUL || wmul->ne[2] < 1 || wmul->ne[2] > 8 || wmul->ne[1] < 2 || wmul->ne[1] > 32 || wmul->ne[3] != 1) {
++    static const int combine_max_tok = ggml_sycl_get_env("GGML_SYCL_IFUSE_COMBINE_MAX_TOK", 8);
++    if (wmul->op != GGML_OP_MUL || wmul->ne[2] < 1 || wmul->ne[2] > combine_max_tok || wmul->ne[1] < 2 || wmul->ne[1] > 32 || wmul->ne[3] != 1) {
+         return 0;
+     }
+     const int64_t n_used = wmul->ne[1];
+@@ -528,6 +529,7 @@ int fuse_combine(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+     const float * sc_d = nullptr;
+     const int32_t * ids_d = nullptr;
+     size_t ids_nb1 = 0;
++    const ggml_tensor * ids_t = nullptr;  // read by the kernel: its last unfused reader is inside the span, so ggml-alloc may put out on it
+     if (has_scale) {
+         const ggml_tensor * rep = cg->nodes[idx[0]], * gr = cg->nodes[idx[1]], * mul = cg->nodes[idx[2]];
+         if (rep->op != GGML_OP_REPEAT || gr->op != GGML_OP_GET_ROWS || mul->op != GGML_OP_MUL || gr->src[0] != rep ||
+@@ -545,6 +547,7 @@ int fuse_combine(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+         sc_d = (const float *) scale->data;
+         ids_d = (const int32_t *) ids->data;
+         ids_nb1 = ids->nb[1] / sizeof(int32_t);
++        ids_t = ids;
+     }
+     // w [1, n_used, n_tok]
+     if (!ggml_are_same_shape(down, wmul) || !ggml_is_contiguous(down) || !f32_rows(down) || w->type != GGML_TYPE_F32 ||
+@@ -578,8 +581,8 @@ int fuse_combine(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+     if (!ggml_is_contiguous(out) || out->type != GGML_TYPE_F32) {
+         return 0;
+     }
+-    if (overlaps(out, down) || overlaps(out, w)) {
+-        return 0;
++    if (overlaps(out, down) || overlaps(out, w) || (ids_t && (overlaps(out, ids_t) || overlaps(out, view_root(ids_t))))) {
++        IFUSE_REJECT("combine overlap", out);
+     }
+     const ggml_tensor * outs[] = { out };
+     if (!span_ok(cg, i, last, outs, 1)) {
+@@ -1080,7 +1083,15 @@ int fuse_relmask(ggml_backend_sycl_context & ctx, const ggml_cgraph * cg, int i)
+         mask->nb[0] != sizeof(ggml_fp16_t) || mask->ne[0] != n_kv || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+         add->ne[1] != n_tok || add->ne[2] != n_head || add->ne[3] != 1 || out->type != GGML_TYPE_F16 ||
+         !ggml_is_contiguous(out) || !ggml_are_same_shape(out, add) || mcp->type != GGML_TYPE_F32 ||
+-        gr->ne[0] != n_head || gr->ne[1] != n_kv * n_tok || c2->ne[0] != n_kv || c2->ne[1] != n_tok || c2->ne[2] != n_head) {
++        gr->ne[0] != n_head || gr->ne[1] * gr->ne[2] * gr->ne[3] != n_kv * n_tok || !ggml_is_contiguous(gr) || c2->ne[0] != n_kv || c2->ne[1] != n_tok || c2->ne[2] != n_head) {
++        if (ifuse_debug() >= 3) {
++            fprintf(stderr, "IFUSE relmask s6: rp %lld (%lld x %lld) mask [%lld %lld %lld %lld] add [%lld %lld %lld %lld] gr [%lld %lld] c2 [%lld %lld %lld] xs rows %lld R [%lld %lld %lld] cont R %d\n",
++                (long long) ggml_nelements(rp), (long long) n_kv, (long long) n_tok, (long long) mask->ne[0], (long long) mask->ne[1],
++                (long long) mask->ne[2], (long long) mask->ne[3], (long long) add->ne[0], (long long) add->ne[1], (long long) add->ne[2],
++                (long long) add->ne[3], (long long) gr->ne[0], (long long) gr->ne[1], (long long) c2->ne[0], (long long) c2->ne[1],
++                (long long) c2->ne[2], (long long) ggml_nrows(xs), (long long) R->ne[0], (long long) R->ne[1], (long long) R->ne[2],
++                (int) ggml_is_contiguous(R));
++        }
+         IFUSE_REJECT("relmask s6", mmT);
+     }
+     // R may be dead by then and share memory with out or the mask cast: the first kernel copies it to a temporary
+-- 
+2.47.3
+

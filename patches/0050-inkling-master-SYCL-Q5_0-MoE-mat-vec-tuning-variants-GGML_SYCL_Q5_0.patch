@@ -1,0 +1,150 @@
+From 2a186f02d9199fbf266d14a0cf7f503807d2d875 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:47:10 +0000
+Subject: [PATCH 20/21] SYCL Q5_0 MoE mat-vec: tuning variants
+ (GGML_SYCL_Q5_0_MOE_ROWS 2/4/8/16, GGML_SYCL_Q5_0_MOE_YSLM), defaults
+ unchanged
+
+Rows (sub-groups) per work-group and staging the expert slot's q8_1 activation row in local memory, selectable at
+run time. Uncensored AD-Q4_K, llama-bench d512 (pp3 | tg64 tok/s): default 4/0 112.1-112.4 | 60.46-60.51; 4/1
+110.4 | 59.84; 8/0 111.7 | 60.25; 8/1 111.0 | 60.01; 16/0 110.9 | 59.98; 16/1 110.6 | 59.89; 2/0 112.7 | 60.67
+(noise). MUL_MAT_ID q5_0 tests pass for every variant. The kernel's speed is not set by its row layout.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-sycl/mmvq.cpp | 111 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 111 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 5a1da63..df7a74a 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2810,6 +2810,103 @@ static void mul_mat_vec_q5_0_q8_1_moe_slm(
+     }
+ }
+ 
++// Variants of the kernel above, picked at run time for tuning (GGML_SYCL_Q5_0_MOE_ROWS = rows (sub-groups) per
++// work-group, default 4 = the kernel above; GGML_SYCL_Q5_0_MOE_YSLM=1 stages the q8_1 activation row of the
++// work-group's expert slot in local memory once, instead of every sub-group reading it from cache).
++template <int ROWS, bool YSLM>
++static void mul_mat_vec_q5_0_q8_1_moe_slm_v(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, uint32_t * slm_all, uint32_t * yslm,
++    const sycl::nd_item<3> & item_ct1) {
++    auto sg = item_ct1.get_sub_group();
++    const int lane       = item_ct1.get_local_id(2);
++    const int r_local    = item_ct1.get_local_id(1);
++    const int expert_idx = item_ct1.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int row        = item_ct1.get_group(2) * ROWS + r_local;
++    const bool valid     = row < nrows;
++    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++    if (i02 == -1) {  // uniform over the work-group
++        if (valid && lane == 0) {
++            dst[row] = 0.0f;
++        }
++        return;
++    }
++    const int blocks_per_row = ncols / QK5_0;
++    const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
++    if constexpr (YSLM) {
++        const int ndw = blocks_per_row * (int) sizeof(block_q8_1) / 4;
++        const uint32_t * ysrc = (const uint32_t *) y;
++        for (int k = r_local * WARP_SIZE + lane; k < ndw; k += ROWS * WARP_SIZE) {
++            yslm[k] = ysrc[k];
++        }
++        sycl::group_barrier(item_ct1.get_group());
++        y = (const block_q8_1 *) yslm;
++    }
++    if (!valid) {
++        return;
++    }
++    const uint8_t * xrow = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride
++                         + (size_t) row * blocks_per_row * sizeof(block_q5_0);
++    uint32_t * slm = slm_all + r_local * (Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4);
++
++    float tmp = 0.0f;
++    for (int b0 = 0; b0 < blocks_per_row; b0 += Q5_0_MOE_SLM_CHUNK) {
++        const int nb  = sycl::min(Q5_0_MOE_SLM_CHUNK, blocks_per_row - b0);
++        const int ndw = nb * (int) sizeof(block_q5_0) / 4;
++        const uint32_t * src = (const uint32_t *) (xrow + (size_t) b0 * sizeof(block_q5_0));
++        for (int k = lane; k < ndw; k += WARP_SIZE) {
++            slm[k] = src[k];
++        }
++        sycl::group_barrier(sg);
++        for (int b = lane; b < nb; b += WARP_SIZE) {
++            const uint16_t * h = (const uint16_t *) ((const uint8_t *) slm + b * sizeof(block_q5_0));
++            const float d5 = (float) sycl::bit_cast<sycl::half>(h[0]);
++            const uint32_t qh = (uint32_t) h[1] | ((uint32_t) h[2] << 16);
++            const block_q8_1 * yb = y + b0 + b;
++            int vl[4], vh[4], u[8];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                vl[i]     = (int) ((uint32_t) h[3 + 2*i] | ((uint32_t) h[4 + 2*i] << 16));
++                vh[i]     = (int) (qh >> (4 * i));
++                u[2*i+0]  = get_int_from_int8_aligned(yb->qs, i);
++                u[2*i+1]  = get_int_from_int8_aligned(yb->qs, i + QI5_0);
++            }
++            tmp += vec_dot_q5_0_q8_1_impl<4>(vl, vh, u, d5, yb->ds);
++        }
++        sycl::group_barrier(sg);
++    }
++    tmp = sycl::reduce_over_group(sg, tmp, sycl::plus<float>());
++    if (lane == 0) {
++        dst[row] = tmp;
++    }
++}
++
++template <int ROWS, bool YSLM>
++static void launch_q5_0_moe_slm_v(const void * vx_base, const void * vy, const int32_t * ids_dev, float * dst_base,
++        const int ncols, const int nrows, const int n_experts_used, const size_t expert_weight_stride,
++        const size_t dst_row_stride, const size_t src1_row_stride, dpct::queue_ptr stream) {
++    const int            block_num_y = (nrows + ROWS - 1) / ROWS;
++    const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
++    const sycl::range<3> block_dims(1, ROWS, WARP_SIZE);
++    const int y_dw = YSLM ? (ncols / QK5_0) * (int) sizeof(block_q8_1) / 4 : 1;
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(ROWS * Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4), cgh);
++        sycl::local_accessor<uint32_t, 1> yslm(sycl::range<1>(y_dw), cgh);
++        cgh.parallel_for(
++            sycl::nd_range<3>(block_nums * block_dims, block_dims),
++            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                mul_mat_vec_q5_0_q8_1_moe_slm_v<ROWS, YSLM>(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                    expert_weight_stride, dst_row_stride, src1_row_stride,
++                    slm.get_multi_ptr<sycl::access::decorated::no>().get(),
++                    yslm.get_multi_ptr<sycl::access::decorated::no>().get(), item);
++            });
++    });
++}
++
+ static bool launch_mul_mat_vec_q5_0_q8_1_moe_slm(
+     const void * vx_base, const void * vy, const int32_t * ids_dev,
+     float * dst_base, const int ncols, const int nrows, const int n_experts_used,
+@@ -2820,6 +2917,20 @@ static bool launch_mul_mat_vec_q5_0_q8_1_moe_slm(
+     if (!enabled || blocks_per_row % 2 != 0 || expert_weight_stride % 4 != 0 || ((uintptr_t) vx_base) % 4 != 0) {
+         return false;
+     }
++    static const int  v_rows = ggml_sycl_get_env("GGML_SYCL_Q5_0_MOE_ROWS", 4);
++    static const bool v_yslm = ggml_sycl_get_env("GGML_SYCL_Q5_0_MOE_YSLM", 0) != 0;
++    if (v_rows != 4 || v_yslm) {
++#define Q5V(R) (v_yslm ? launch_q5_0_moe_slm_v<R, true> : launch_q5_0_moe_slm_v<R, false>)(vx_base, vy, ids_dev, dst_base, \
++                    ncols, nrows, n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, stream)
++        switch (v_rows) {
++            case 2:  Q5V(2);  return true;
++            case 4:  Q5V(4);  return true;
++            case 8:  Q5V(8);  return true;
++            case 16: Q5V(16); return true;
++            default: break;
++        }
++#undef Q5V
++    }
+     const int            block_num_y = (nrows + Q5_0_MOE_SLM_ROWS - 1) / Q5_0_MOE_SLM_ROWS;
+     const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
+     const sycl::range<3> block_dims(1, Q5_0_MOE_SLM_ROWS, WARP_SIZE);
+-- 
+2.47.3
+

@@ -1,0 +1,63 @@
+From c9b8f711dde07910a380e065517b5057a809fe45 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:06:44 +0000
+Subject: [PATCH] debug: LLAMA_GRAPH_TIMING=N prints the mean graph build and
+ sched alloc time of rebuilt graphs (stderr)
+
+Measured with the DSpark confidence gate (n-max 4, gate 0.8, temp 0, no SYCL graphs): ~2.5 rebuilds per speculative
+step (target + drafter contexts), build 0.20 ms + sched alloc 0.44 ms mean, ~1.6 ms per step - the whole overhead that
+cancels the gate's saving. A per-shape graph cache in llama_context would save only the build part (the scheduler
+executes the splits of the last allocated graph, so allocation would still run). Fixed n-max 2: rebuilds are the tiny
+drafter graphs only (0.11 ms).
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7490cf3..1258f03 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1835,16 +1835,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         n_reused++;
+     } else {
+         gf_res_prev_active = nullptr;
++        // LLAMA_GRAPH_TIMING=N (local profiling aid): every N rebuilds print the mean graph build and sched alloc time
++        static const int graph_timing = [] { const char * e = getenv("LLAMA_GRAPH_TIMING"); return e ? atoi(e) : 0; }();
++        static double t_build_ms = 0.0, t_alloc_ms = 0.0;
++        static long n_rebuilds = 0;
++        const auto t_start_us = ggml_time_us();
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+-        //const auto t_start_us = ggml_time_us();
+-
+         gf = model.build_graph(gparams);
+-
+-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
++        const auto t_built_us = ggml_time_us();
+ 
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+@@ -1857,6 +1859,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
++        if (graph_timing > 0) {
++            t_build_ms += (t_built_us - t_start_us) / 1000.0;
++            t_alloc_ms += (ggml_time_us() - t_built_us) / 1000.0;
++            if (++n_rebuilds % graph_timing == 0) {
++                fprintf(stderr, "graph timing: %ld rebuilds, build %.2f ms, sched alloc %.2f ms (mean; last: %d nodes, %u tokens)\n",
++                        n_rebuilds, t_build_ms / n_rebuilds, t_alloc_ms / n_rebuilds, ggml_graph_n_nodes(gf), ubatch.n_tokens);
++            }
++        }
+ 
+         gf_res_prev_active = res;
+     }
+-- 
+2.47.3
+

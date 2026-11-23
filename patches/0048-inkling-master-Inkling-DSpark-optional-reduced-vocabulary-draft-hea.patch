@@ -1,0 +1,211 @@
+From 22f506cd945e009e11ad4c952738f7c026253949 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 13:00:00 +0000
+Subject: [PATCH 18/21] Inkling DSpark: optional reduced-vocabulary draft head;
+ draft ids come back in the chain-state rows
+
+A drafter GGUF with dspark_out_sub (target lm-head rows of N tokens, Q8_0), dspark_markov_w1_sub and
+dspark_out_sub_ids (made by scripts/make-dspark-subvocab.py, N = 32768 from Inkling's own answers,
+which use 10.8k distinct tokens) runs each chained position's lm-head pass over those rows (80 MB instead of
+492 MB), takes the argmax in the subset and writes the full token id into element `rank` of the position's
+chain-state row. The driver reads the ids from h_nextn and requests a logits row only for the anchor, so the
+6.4 MB block logits copy and the host argmax over 200k disappear. LLAMA_DSPARK_SUB=0 = full head.
+Uncensored AD-Q4_K, n-max 1: draft 2.43 -> 1.27 ms, step 26.6 -> 25.4 ms; temp-0 acceptance n-max 2 0.487 vs 0.494.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 20 +++++++++++++-
+ src/llama-arch.cpp     |  6 ++++
+ src/llama-arch.h       |  3 ++
+ src/llama-model.h      |  3 ++
+ src/models/dspark.cpp  | 62 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 93 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index eb752ae..3ef3a17 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1380,6 +1380,9 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+     // which come back from the injection and are kept per sequence, indexed by position
+     bool    has_rnn_context = false;
+     int32_t markov_rank     = 0;
++    // reduced-vocabulary drafter (dspark_out_sub): the graph returns the draft ids in element markov_rank of each
++    // position's chain-state row instead of full logits
++    bool    sub_ids         = false;
+ 
+     size_t context_rows = 0;
+     std::vector<float>     context_embd;
+@@ -1412,6 +1415,8 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+             char buf[32] = {};
+             has_rnn_context = llama_model_meta_val_str(model_dft, "dflash.dspark.markov_rank", buf, sizeof(buf)) >= 0;
+             markov_rank = has_rnn_context ? std::atoi(buf) : 0;
++            const char * e = getenv("LLAMA_DSPARK_SUB");
++            sub_ids = has_rnn_context && llama_model_meta_val_str(model_dft, "dflash.dspark.sub_vocab", buf, sizeof(buf)) >= 0 && (!e || std::atoi(e) != 0);
+         }
+ 
+         if (has_rnn_context) {
+@@ -1511,7 +1516,8 @@ public:
+             i_block_beg[seq_id] = batch.size();
+             n_block    [seq_id] = n_block_tokens;
+             for (int32_t i = 0; i < n_block_tokens; ++i) {
+-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, true);
++                // with draft ids in the state rows only position 0 needs a logits row (no full-vocabulary copies)
++                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !sub_ids || i == 0);
+                 if (has_rnn_context) {
+                     // the context features of the committed anchor condition the recurrent head
+                     const llama_pos pos = dp.pos0 - 1;
+@@ -1548,6 +1554,18 @@ public:
+ 
+             auto & result = *dp.result;
+ 
++            if (sub_ids) {
++                const float * rows = llama_get_embeddings_nextn(ctx_dft);
++                if (!rows) {
++                    LOG_ERR("%s: DSpark draft ids missing (no h_nextn rows)\n", __func__);
++                    continue;
++                }
++                for (int32_t i = 1; i < std::min(n_block_tokens, 1 + params.n_max); ++i) {
++                    result.push_back((llama_token) std::lrintf(rows[(size_t) (beg + i) * n_embd_dec + markov_rank]));
++                }
++                continue;
++            }
++
+             // DSpark: read from the first draft slot, truncate below the confidence threshold
+             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+             // bonus-anchor drafts read the mask positions only, like DFlash
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index a0aa502..678ac76 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -917,6 +917,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_DSPARK_FUSE,                            "dspark_fuse" },
+     { LLM_TENSOR_DSPARK_NORM,                            "dspark_norm" },
+     { LLM_TENSOR_DSPARK_HIDDEN_OUT,                      "dspark_hidden_out" },
++    { LLM_TENSOR_DSPARK_OUT_SUB,                         "dspark_out_sub" },
++    { LLM_TENSOR_DSPARK_MARKOV_W1_SUB,                   "dspark_markov_w1_sub" },
++    { LLM_TENSOR_DSPARK_OUT_SUB_IDS,                     "dspark_out_sub_ids" },
+     { LLM_TENSOR_DFLARE_NORM,                            "blk.%d.dflare_norm" },
+     { LLM_TENSOR_ATTN_K_CTX,                             "blk.%d.attn_k_ctx" },
+     { LLM_TENSOR_ATTN_V_CTX,                             "blk.%d.attn_v_ctx" },
+@@ -1351,6 +1354,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_DSPARK_FUSE,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_DSPARK_NORM,                {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+     {LLM_TENSOR_DSPARK_HIDDEN_OUT,          {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DSPARK_OUT_SUB,             {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_DSPARK_MARKOV_W1_SUB,       {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_DSPARK_OUT_SUB_IDS,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_DFLARE_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_ATTN_K_CTX,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ATTN_V_CTX,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 267dc10..c107477 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -922,6 +922,9 @@ enum llm_tensor {
+     LLM_TENSOR_DSPARK_FUSE,
+     LLM_TENSOR_DSPARK_NORM,
+     LLM_TENSOR_DSPARK_HIDDEN_OUT,
++    LLM_TENSOR_DSPARK_OUT_SUB,
++    LLM_TENSOR_DSPARK_MARKOV_W1_SUB,
++    LLM_TENSOR_DSPARK_OUT_SUB_IDS,
+     LLM_TENSOR_DFLARE_NORM,
+     LLM_TENSOR_ATTN_K_CTX,
+     LLM_TENSOR_ATTN_V_CTX,
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 8ea9afc..eb037d3 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -948,6 +948,9 @@ struct llama_model {
+     struct ggml_tensor * dspark_norm         = nullptr;
+     struct ggml_tensor * dspark_hidden_out   = nullptr;
+     struct ggml_tensor * dspark_hidden_out_b = nullptr;
++    struct ggml_tensor * dspark_out_sub        = nullptr; // inkling2: optional reduced-vocabulary draft head (target lm-head rows)
++    struct ggml_tensor * dspark_markov_w1_sub  = nullptr; //   markov_w1 rows of the same tokens
++    struct ggml_tensor * dspark_out_sub_ids    = nullptr; //   f32 full-vocabulary id of each row
+ 
+     // zaya1
+     struct ggml_tensor * res_scale_in   = nullptr;
+diff --git a/src/models/dspark.cpp b/src/models/dspark.cpp
+index ca92a01..4fb8e65 100644
+--- a/src/models/dspark.cpp
++++ b/src/models/dspark.cpp
+@@ -920,6 +920,18 @@ void llama_model_dflash::load_tensors_inkling2() {
+     dspark_joint_proj_b = create_tensor(tn(LLM_TENSOR_DSPARK_JOINT_PROJ, "bias"), {3*rank}, 0);
+     dspark_hidden_out = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "weight"), {rank, n_embd}, 0);
+     dspark_hidden_out_b = create_tensor(tn(LLM_TENSOR_DSPARK_HIDDEN_OUT, "bias"), {n_embd}, 0);
++    // optional reduced-vocabulary head (scripts/make-dspark-subvocab.py): the chained positions run their lm-head
++    // pass over these rows only, and the draft ids come back in the chain state rows instead of full logits
++    if (const auto * sub_meta = ml->get_tensor_meta("dspark_out_sub.weight")) {
++        const int64_t n_sub = sub_meta->ne[1];
++        dspark_out_sub       = create_tensor(tn(LLM_TENSOR_DSPARK_OUT_SUB, "weight"), {n_embd, n_sub}, 0);
++        dspark_markov_w1_sub = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1_SUB, "weight"), {rank, n_sub}, 0);
++        dspark_out_sub_ids   = create_tensor(tn(LLM_TENSOR_DSPARK_OUT_SUB_IDS, "weight"), {n_sub}, 0);
++        if (rank + 1 > n_embd) {
++            throw std::runtime_error("Inkling2 DSpark: no room for the draft id in the chain state row");
++        }
++        LLAMA_LOG_INFO("%s: DSpark reduced draft vocabulary: %lld tokens\n", __func__, (long long) n_sub);
++    }
+     for (int i = 0; i < n_layer; ++i) {
+         auto & l = layers[i];
+         const int64_t hd = hparams.n_embd_head_k(i);
+@@ -1075,6 +1087,56 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
+         res->t_logits = ggml_cont(ctx0, ggml_view_2d(ctx0, base, hparams.n_vocab_unpadded, n_tokens, base->nb[1], 0));
+         return;
+     }
++    const auto block_cols = [&](ggml_tensor * t, int64_t i) {
++        return ggml_cont(ctx0, ggml_view_2d(ctx0, t, t->ne[0], nb, block*t->nb[1], i*t->nb[1]));
++    };
++    const auto to_block_order = [&](ggml_tensor * t) {
++        t = ggml_reshape_3d(ctx0, t, t->ne[0], nb, block);
++        return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, t, 0, 2, 1, 3)), t->ne[0], n_tokens);
++    };
++    static const bool use_sub = [] { const char * e = getenv("LLAMA_DSPARK_SUB"); return !e || atoi(e) != 0; }();
++    if (model.dspark_out_sub && use_sub) {
++        // reduced-vocabulary head: per chained position one lm-head pass over the subset rows of
++        // (backbone row + correction), argmax in the subset; the full id of the drafted token goes into element
++        // `rank` of that position's chain-state row (read by the speculative driver), no full-vocabulary logits
++        const int64_t n_sub = model.dspark_out_sub->ne[1];
++        const char * nc_str = getenv("LLAMA_DSPARK_NCHAIN");
++        const int64_t nc_env = nc_str ? (int64_t) atoi(nc_str) : 0;
++        const int64_t n_chain = nc_env > 0 ? std::min<int64_t>(nc_env, block - 1) : block - 1;
++        auto * zrow  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, nb), 0.0f);
++        auto * st    = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
++        auto * ctxv  = block_cols(f_rnn, 0);
++        auto * idtab = ggml_reshape_2d(ctx0, model.dspark_out_sub_ids, 1, n_sub);
++        auto * rows  = zrow;
++        ggml_tensor * prev = ids;
++        for (int64_t i = 1; i <= n_chain; ++i) {
++            auto * hid = block_cols(cur, i);
++            auto * w1  = ggml_get_rows(ctx0, i == 1 ? model.dspark_markov_w1 : model.dspark_markov_w1_sub, prev);
++            auto * joint = ggml_concat(ctx0, ggml_concat(ctx0, st, w1, 0), ggml_concat(ctx0, hid, ctxv, 0), 0);
++            joint = ggml_add(ctx0, build_lora_mm(model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
++            const auto chunk = [&](int64_t j) {
++                return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, joint->ne[1], joint->nb[1], j*rank*joint->nb[0]));
++            };
++            auto * gate = ggml_sigmoid(ctx0, chunk(0));
++            auto * cand = ggml_tanh(ctx0, chunk(1));
++            st = ggml_add(ctx0, cand, ggml_mul(ctx0, gate, ggml_sub(ctx0, st, cand)));
++            auto * corr = ggml_add(ctx0, build_lora_mm(model.dspark_hidden_out, ggml_tanh(ctx0, chunk(2))), model.dspark_hidden_out_b);
++            auto * lg = build_lora_mm(model.dspark_out_sub, ggml_add(ctx0, hid, corr));   // softcap is monotone: skipped
++            ggml_prec_set_acc(lg, GGML_PREC_F32);
++            prev = ggml_argmax(ctx0, lg);                                                  // subset index
++            auto * idf = ggml_get_rows(ctx0, idtab, prev);                                 // [1, nb] full id as f32
++            auto * row = ggml_pad(ctx0, ggml_concat(ctx0, st, idf, 0), n_embd - rank - 1, 0, 0, 0);
++            rows = ggml_concat(ctx0, rows, row, 1);
++        }
++        for (int64_t i = n_chain + 1; i < block; ++i) {
++            rows = ggml_concat(ctx0, rows, zrow, 1);
++        }
++        res->t_h_nextn = to_block_order(rows);
++        cb(res->t_h_nextn, "dspark_chain_state", -1);
++        ggml_build_forward_expand(gf, res->t_h_nextn);
++        res->t_logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_vocab_unpadded, n_tokens), 0.0f);
++        return;
++    }
+     auto * state = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, nb), 0.0f);
+     auto * states = ggml_pad(ctx0, state, n_embd - rank, 0, 0, 0);
+     const auto column = [&](ggml_tensor * t, int64_t i) {
+-- 
+2.47.3
+

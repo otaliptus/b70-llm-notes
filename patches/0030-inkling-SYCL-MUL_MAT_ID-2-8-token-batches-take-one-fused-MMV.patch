@@ -1,0 +1,50 @@
+From 3358189585fb6aa3f139aced861ec51220d92f68 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 00:09:59 +0000
+Subject: [PATCH 12/13] SYCL MUL_MAT_ID: 2-8 token batches take one fused MMVQ
+ launch per token (GGML_SYCL_MMID_SMALL_BATCH, default 8)
+
+pp2 49 -> 92, pp4 70 -> 131, pp8 110 -> 169 tok/s on Inkling 2 Mini Uncensored AD-Q4_K (B70); tg unchanged.
+MUL_MAT_ID op tests 447/447; KLD at -ub 4 0.0062 vs 0.0057 on the old path.
+
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 851fe4a..d23bac2 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -5783,6 +5783,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+             return;
+         }
+     }
++    // Small batches (speculative verify, short prompts): one fused MMVQ launch per token instead of the
++    // per-expert loop or the grouped dequant GEMM, which cost ~40x a single-token launch at 2 tokens.
++    // GGML_SYCL_MMID_SMALL_BATCH=N (default 8, 0 = off) is the largest token count that takes this path.
++    static const int mmid_small_batch = ggml_sycl_get_env("GGML_SYCL_MMID_SMALL_BATCH", 8);
++    if (ne12 > 1 && ne12 <= mmid_small_batch && ids->ne[1] == ne12 && ne13 == 1) {
++        ggml_tensor src1_t = *src1, ids_t = *ids, dst_t = *dst;
++        src1_t.ne[2] = 1; ids_t.ne[1] = 1; dst_t.ne[2] = 1;
++        src1_t.src[0] = nullptr;
++        dst_t.src[0] = (ggml_tensor *) src0; dst_t.src[1] = &src1_t; dst_t.src[2] = &ids_t;
++        if (ggml_sycl_mul_mat_id_should_use_mmvq(&dst_t)) {
++            for (int64_t t = 0; t < ne12; ++t) {
++                src1_t.data = (char *) src1->data + t * nb12;
++                ids_t.data  = (char *) ids->data + t * ids->nb[1];
++                dst_t.data  = (char *) dst->data + t * nb2;
++                if (!ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, &src1_t, &ids_t, &dst_t)) {
++                    GGML_ABORT("MMID small-batch: fused MMVQ refused token %lld", (long long) t);
++                }
++            }
++            return;
++        }
++    }
+     GGML_ASSERT(!ggml_sycl_mul_mat_id_should_use_mmvq(dst));
+ 
+     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
+-- 
+2.47.3
+

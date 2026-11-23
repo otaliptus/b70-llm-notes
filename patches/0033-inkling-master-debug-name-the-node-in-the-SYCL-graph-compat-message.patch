@@ -1,0 +1,72 @@
+From 23baa98e2ae8acd8e93a03dfe1047623047ff59e Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:41:48 +0000
+Subject: [PATCH 02/13] debug: name the node in the SYCL graph-compat messages;
+ test-backend-ops INKLING_SHAPES=1 perf shapes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 11 +++++++----
+ tests/test-backend-ops.cpp       | 16 ++++++++++++++++
+ 2 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 12f9248..947b704 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7036,8 +7036,11 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+                 // queue after submitting a memcpy operation, but wait() can't be called on a queue
+                 // that is recording to a graph.
+                 if (ggml_sycl_mul_mat_id_needs_sync(ctx, node)) {
+-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s\n", __func__,
+-                                   ggml_op_name(node_op));
++                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to host wait in %s (%s, src0 %s, src1 ne1 %lld ne2 %lld, ids ne0 %lld ne1 %lld, reordered %d)\n", __func__,
++                                   ggml_op_name(node_op), node->name, ggml_type_name(node->src[0]->type),
++                                   (long long) node->src[1]->ne[1], (long long) node->src[1]->ne[2],
++                                   (long long) node->src[2]->ne[0], (long long) node->src[2]->ne[1],
++                                   node->src[0]->extra ? (int) ((const ggml_tensor_extra_gpu *) node->src[0]->extra)->optimized_feature.reorder : -1);
+                     return false;
+                 }
+                 break;
+@@ -7069,8 +7072,8 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
+                 }
+ #ifndef GGML_SYCL_GRAPH_DNNL_SUPPORTED
+                 if (mul_mat_uses_onednn(ctx->device, node)) {
+-                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to %s using oneDNN\n", __func__,
+-                                   ggml_op_name(node_op));
++                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to %s using oneDNN (%s, src0 %s, src1 ne1 %lld)\n", __func__,
++                                   ggml_op_name(node_op), node->name, ggml_type_name(node->src[0]->type), (long long) node->src[1]->ne[1]);
+                     return false;
+                 }
+ #endif
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e377277..62da325 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13845,6 +13845,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // INKLING_SHAPES=1: only Inkling 2 Mini decode shapes (128 experts, 8 used, n_embd 2304, n_ff_exp 1152)
++    if (getenv("INKLING_SHAPES")) {
++        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
++            for (int n : {1, 8}) {
++                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304)); // gate_up
++                test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152)); // down
++            }
++        }
++        for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 3072, 1, 2304, {1, 1}, {1, 1})); // q / gate
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 2304, 1, 3072, {1, 1}, {1, 1})); // o
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 201024, 1, 2304, {1, 1}, {1, 1})); // lm head
++        }
++        return test_cases;
++    }
++
+     test_cases.emplace_back(new test_timestep_embedding());
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
+     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 1, 10000));
+-- 
+2.47.3
+

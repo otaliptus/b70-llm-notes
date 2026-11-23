@@ -1,0 +1,190 @@
+From 73092a5e299066760acf1eed3b5a15ed6b4c136f Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:04:30 +0000
+Subject: [PATCH 12/13] SYCL MoE mat-vec: Q5_0 through local memory (coalesced
+ 32-bit row loads, a whole block per work-item)
+
+Inkling 2 Mini Uncensored AD-Q4_K has Q5_0 expert down projections (k = 1152): 8 experts, n = 1,
+94 -> 34 us (test-backend-ops perf); tg64 46.4 -> 57.6. GGML_SYCL_Q5_0_MOE_SLM=0 restores the old path.
+INKLING_SHAPES perf cases include Q5_0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/mmvq.cpp    | 102 ++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-sycl/vecdotq.hpp |  25 ++++++++
+ tests/test-backend-ops.cpp     |   2 +-
+ 3 files changed, 127 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index 614b38b..7301e8e 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -2740,6 +2740,102 @@ static void launch_mul_mat_vec_q_moe(
+     });
+ }
+ 
++// Q5_0 MoE mat-vec through local memory. A Q5_0 block is 22 bytes, so with one block per work-item the
++// sub-group reads 16-bit pieces at a 22-byte stride (11 gathers per block). Here each sub-group copies a
++// chunk of its row into local memory with coalesced 32-bit loads, then every work-item decodes whole blocks
++// from there. Rows must start 4-byte aligned: an even number of blocks per row (k = 1152 has 36).
++static constexpr int Q5_0_MOE_SLM_ROWS  = 4;   // sub-groups (rows) per work-group
++static constexpr int Q5_0_MOE_SLM_CHUNK = 48;  // blocks per local-memory chunk (even)
++
++static void mul_mat_vec_q5_0_q8_1_moe_slm(
++    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
++    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
++    const int ncols, const int nrows,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, uint32_t * slm_all,
++    const sycl::nd_item<3> & item_ct1) {
++    auto sg = item_ct1.get_sub_group();
++    const int lane       = item_ct1.get_local_id(2);
++    const int r_local    = item_ct1.get_local_id(1);
++    const int expert_idx = item_ct1.get_group(1);
++    const int i02        = ids_dev[expert_idx];
++    const int row        = item_ct1.get_group(2) * Q5_0_MOE_SLM_ROWS + r_local;
++    if (row >= nrows) {
++        return;
++    }
++    float * dst = (float *) ((char *) dst_base + (size_t) expert_idx * dst_row_stride);
++    if (i02 == -1) {
++        if (lane == 0) {
++            dst[row] = 0.0f;
++        }
++        return;
++    }
++
++    const int blocks_per_row = ncols / QK5_0;
++    const uint8_t * xrow = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride
++                         + (size_t) row * blocks_per_row * sizeof(block_q5_0);
++    const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base + (size_t) expert_idx * src1_row_stride);
++    uint32_t * slm = slm_all + r_local * (Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4);
++
++    float tmp = 0.0f;
++    for (int b0 = 0; b0 < blocks_per_row; b0 += Q5_0_MOE_SLM_CHUNK) {
++        const int nb  = sycl::min(Q5_0_MOE_SLM_CHUNK, blocks_per_row - b0);
++        const int ndw = nb * (int) sizeof(block_q5_0) / 4;
++        const uint32_t * src = (const uint32_t *) (xrow + (size_t) b0 * sizeof(block_q5_0));
++        for (int k = lane; k < ndw; k += WARP_SIZE) {
++            slm[k] = src[k];
++        }
++        sycl::group_barrier(sg);
++        for (int b = lane; b < nb; b += WARP_SIZE) {
++            const uint16_t * h = (const uint16_t *) ((const uint8_t *) slm + b * sizeof(block_q5_0));
++            const float d5 = (float) sycl::bit_cast<sycl::half>(h[0]);
++            const uint32_t qh = (uint32_t) h[1] | ((uint32_t) h[2] << 16);
++            const block_q8_1 * yb = y + b0 + b;
++            int vl[4], vh[4], u[8];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                vl[i]     = (int) ((uint32_t) h[3 + 2*i] | ((uint32_t) h[4 + 2*i] << 16));
++                vh[i]     = (int) (qh >> (4 * i));
++                u[2*i+0]  = get_int_from_int8_aligned(yb->qs, i);
++                u[2*i+1]  = get_int_from_int8_aligned(yb->qs, i + QI5_0);
++            }
++            tmp += vec_dot_q5_0_q8_1_impl<4>(vl, vh, u, d5, yb->ds);
++        }
++        sycl::group_barrier(sg);
++    }
++
++    tmp = sycl::reduce_over_group(sg, tmp, sycl::plus<float>());
++    if (lane == 0) {
++        dst[row] = tmp;
++    }
++}
++
++static bool launch_mul_mat_vec_q5_0_q8_1_moe_slm(
++    const void * vx_base, const void * vy, const int32_t * ids_dev,
++    float * dst_base, const int ncols, const int nrows, const int n_experts_used,
++    const size_t expert_weight_stride, const size_t dst_row_stride,
++    const size_t src1_row_stride, dpct::queue_ptr stream) {
++    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_Q5_0_MOE_SLM", 1) != 0;
++    const int blocks_per_row = ncols / QK5_0;
++    if (!enabled || blocks_per_row % 2 != 0 || expert_weight_stride % 4 != 0 || ((uintptr_t) vx_base) % 4 != 0) {
++        return false;
++    }
++    const int            block_num_y = (nrows + Q5_0_MOE_SLM_ROWS - 1) / Q5_0_MOE_SLM_ROWS;
++    const sycl::range<3> block_nums(1, (unsigned) n_experts_used, (unsigned) block_num_y);
++    const sycl::range<3> block_dims(1, Q5_0_MOE_SLM_ROWS, WARP_SIZE);
++    stream->submit([&](sycl::handler & cgh) {
++        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(Q5_0_MOE_SLM_ROWS * Q5_0_MOE_SLM_CHUNK * sizeof(block_q5_0) / 4), cgh);
++        cgh.parallel_for(
++            sycl::nd_range<3>(block_nums * block_dims, block_dims),
++            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
++                mul_mat_vec_q5_0_q8_1_moe_slm(vx_base, vy, dst_base, ids_dev, ncols, nrows,
++                    expert_weight_stride, dst_row_stride, src1_row_stride,
++                    slm.get_multi_ptr<sycl::access::decorated::no>().get(), item);
++            });
++    });
++    return true;
++}
++
+ bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type) {
+     switch (src0_type) {
+         case GGML_TYPE_Q4_0:
+@@ -2812,7 +2908,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
+         case GGML_TYPE_Q5_0:
+-            launch_mul_mat_vec_q_moe<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
++            if (launch_mul_mat_vec_q5_0_q8_1_moe_slm(vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
++                    expert_weight_stride, dst_row_stride, src1_row_stride, stream)) {
++                return true;
++            }
++            launch_mul_mat_vec_q_moe<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ_MOE, vec_dot_q5_0_q8_1_moe>(
+                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used,
+                 expert_weight_stride, dst_row_stride, src1_row_stride, stream);
+             return true;
+diff --git a/ggml/src/ggml-sycl/vecdotq.hpp b/ggml/src/ggml-sycl/vecdotq.hpp
+index 2da7e25..16f3a3f 100644
+--- a/ggml/src/ggml-sycl/vecdotq.hpp
++++ b/ggml/src/ggml-sycl/vecdotq.hpp
+@@ -1229,6 +1229,31 @@ static __dpct_inline__ float vec_dot_nvfp4_q8_1(const void * __restrict__ vbq,
+     return sum;
+ }
+ 
++// MoE mat-vec variant: one work-item takes a whole Q5_0 block (vdr 4, iqs 0). With vdr 2 two work-items
++// share a block and each re-reads d and qh; the expert down projections (k = 1152, 36 blocks a row) ran at
++// ~120 GB/s that way.
++#define VDR_Q5_0_Q8_1_MMVQ_MOE 4
++static __dpct_inline__ float
++vec_dot_q5_0_q8_1_moe(const void *__restrict__ vbq,
++                      const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
++    const block_q5_0 * bq5_0 = (const block_q5_0 *) vbq;
++
++    int vl[VDR_Q5_0_Q8_1_MMVQ_MOE];
++    int vh[VDR_Q5_0_Q8_1_MMVQ_MOE];
++    int  u[2*VDR_Q5_0_Q8_1_MMVQ_MOE];
++
++    const int qh = get_int_from_uint8(bq5_0->qh, 0);
++#pragma unroll
++    for (int i = 0; i < VDR_Q5_0_Q8_1_MMVQ_MOE; ++i) {
++        vl[i]    = get_int_from_uint8(bq5_0->qs, iqs + i);
++        vh[i]    = qh >> (4 * (iqs + i));
++        u[2*i+0] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
++        u[2*i+1] = get_int_from_int8_aligned(bq8_1->qs, iqs + i + QI5_0);
++    }
++
++    return vec_dot_q5_0_q8_1_impl<VDR_Q5_0_Q8_1_MMVQ_MOE>(vl, vh, u, bq5_0->d, bq8_1->ds);
++}
++
+ static __dpct_inline__ float
+ vec_dot_q5_0_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 002fb61..0e20729 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13865,7 +13865,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // INKLING_SHAPES=1: only Inkling 2 Mini decode shapes (128 experts, 8 used, n_embd 2304, n_ff_exp 1152)
+     if (getenv("INKLING_SHAPES")) {
+-        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
++        for (ggml_type t : {GGML_TYPE_NVFP4, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+             for (int n : {1, 8}) {
+                 test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304)); // gate_up
+                 if (ggml_blck_size(t) <= 64) { // K-quants need k % 256 == 0, and k = 1152 is not
+-- 
+2.47.3
+

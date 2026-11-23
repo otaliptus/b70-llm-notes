@@ -1,0 +1,101 @@
+From 68df11cf382be0ab31745f98725affebca03b4ad Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 03:41:49 +0000
+Subject: [PATCH 05/13] debug: GGML_SYCL_OPPROF=1 per-op wall time table for
+ 1-token graphs (syncs after every node)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 60 ++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 947b704..10fb39b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6731,7 +6731,65 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
+     return skip;
+ }
+ 
++// GGML_SYCL_OPPROF=1 (local profiling aid): wait after every node or fused group and add the wall time to
++// "op|type|name-without-layer"; prints a table every GGML_SYCL_OPPROF_EVERY graphs of 1 token (default 32).
++#include <map>
++#include <chrono>
++#include <string>
++struct sycl_opprof_entry { double us = 0; long n = 0; };
++static std::map<std::string, sycl_opprof_entry> g_opprof;
++static long g_opprof_graphs = 0;
++static std::string sycl_opprof_key(const ggml_tensor * node) {
++    std::string name = node->name;
++    size_t dash = name.rfind('-');
++    if (dash != std::string::npos && dash + 1 < name.size() && isdigit((unsigned char) name[dash + 1])) name.resize(dash);
++    size_t paren = name.find(" (");
++    if (paren != std::string::npos) name.resize(paren);
++    std::string k = ggml_op_desc(node);
++    k += "|"; k += node->src[0] ? ggml_type_name(node->src[0]->type) : "-";
++    k += "|"; k += name;
++    return k;
++}
++static void sycl_opprof_print() {
++    std::vector<std::pair<std::string, sycl_opprof_entry>> v(g_opprof.begin(), g_opprof.end());
++    std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.us > b.second.us; });
++    double tot = 0; long ntot = 0; for (auto & e : v) { tot += e.second.us; ntot += e.second.n; }
++    fprintf(stderr, "OPPROF %ld graphs: %.1f us/graph, %.1f launches/graph\n", g_opprof_graphs, tot / g_opprof_graphs, (double) ntot / g_opprof_graphs);
++    for (auto & e : v) {
++        fprintf(stderr, "OPPROF %9.1f us/graph %7.1f n/graph %7.2f us/each  %s\n", e.second.us / g_opprof_graphs,
++                (double) e.second.n / g_opprof_graphs, e.second.us / e.second.n, e.first.c_str());
++    }
++    g_opprof.clear(); g_opprof_graphs = 0;
++}
++
++static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph, bool prof);
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
++    static const int prof_env = ggml_sycl_get_env("GGML_SYCL_OPPROF", 0);
++    static const int prof_every = ggml_sycl_get_env("GGML_SYCL_OPPROF_EVERY", 32);
++    bool prof = prof_env != 0 && cgraph->n_nodes > 0;
++    if (prof) {
++        // only 1-token graphs (decode): the last node is the logits with ne[1] == 1
++        const ggml_tensor * last = cgraph->nodes[cgraph->n_nodes - 1];
++        prof = last->ne[1] == 1 && last->ne[0] > 100000;
++    }
++    ggml_backend_sycl_graph_compute_impl_inner(sycl_ctx, cgraph, prof);
++    if (prof && ++g_opprof_graphs >= prof_every) sycl_opprof_print();
++}
++
++static void ggml_backend_sycl_graph_compute_impl_inner(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph, bool prof) {
++    std::string prof_key;
++    auto prof_t = std::chrono::steady_clock::now();
++    auto prof_flush = [&]() {
++        if (!prof) return;
++        sycl_ctx->stream()->wait();
++        auto t = std::chrono::steady_clock::now();
++        if (!prof_key.empty()) {
++            auto & e = g_opprof[prof_key];
++            e.us += std::chrono::duration<double, std::micro>(t - prof_t).count(); e.n++;
++        }
++        prof_t = t;
++    };
++    if (prof) { sycl_ctx->stream()->wait(); prof_t = std::chrono::steady_clock::now(); }
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+         if (ggml_sycl_is_view_or_noop(node)) {
+@@ -6740,6 +6798,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        if (prof) { prof_flush(); prof_key = sycl_opprof_key(node); }
+ 
+         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
+         if (nodes_to_skip != 0) {
+@@ -6849,6 +6908,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+         GGML_ASSERT(ok);
+     }
++    prof_flush();
+ }
+ 
+ #ifdef GGML_SYCL_GRAPH
+-- 
+2.47.3
+

@@ -1,0 +1,29 @@
+From 07f2f1dd6be7c91c98f2243270a1653b7fbd5c08 Mon Sep 17 00:00:00 2001
+From: b70-notes <b70-notes@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 16:42:25 +0000
+Subject: [PATCH 10/13] tests: INKLING_LONG_FA cases at kv 32768/65536/98304
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: otaliptus <56600661+otaliptus@users.noreply.github.com>
+---
+ tests/test-backend-ops.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8faf50f..002fb61 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13442,8 +13442,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     // a mask per Q head (Inkling 2 relative-position bias added to the mask): 8 KV heads, 3 Q heads each
+     if (getenv("INKLING_LONG_FA")) {  // long-context per-head-mask cases (slow CPU reference)
+-        for (int64_t kv : { 65536, 69632, 98304 }) {
+-            for (int64_t nb : { 1, 16 }) {
++        for (int64_t kv : { 32768, 65536, 98304 }) {
++            for (int64_t nb : { 1, 16, 256 }) {
+                 test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32,
+                     GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 24));
+             }
+-- 
+2.47.3
+
