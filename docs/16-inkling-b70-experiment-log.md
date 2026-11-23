@@ -22,7 +22,7 @@ Both builds start at nextsycl commit `e3f1fd891b7fda6f478a326d913d28893a4e9811`.
 
 ## Repeat the graded suite
 
-On the benchmark host, the workspace launcher `coop-lab/bench/inkling-unc-native-serve.sh` selects 0059 by default. Setting `DRAFT_WINDOW=2048` selects the installed 0060 build. The portable launcher takes an explicit `RUNTIME` directory for either build. The measured 0059 configuration selected an 8,192-token prefill chunk and a 6,144 MiB host checkpoint budget. [Portable launcher](../scripts/serve-inkling-nextsycl.sh)
+On the benchmark host, a local wrapper around the portable launcher selects 0059 by default, and setting `DRAFT_WINDOW=2048` selects the installed 0060 build. The portable launcher takes an explicit `RUNTIME` directory for either build. The measured 0059 configuration selected an 8,192-token prefill chunk and a 6,144 MiB host checkpoint budget. [Portable launcher](../scripts/serve-inkling-nextsycl.sh)
 
 With 0059 listening on the default port and `API_KEY_FILE` pointing to the server's key, run this from the notes checkout. The original runner, task definitions and client match the public copies byte for byte. The public grader makes the Python container image configurable. The command selects the image used in the original run and gives each replay a fresh name because the runner resumes completed tasks by name. [Graded runner](../bench/run_bench.py) · [Tasks](../bench/tasks.py) · [Grader](../bench/grading.py)
 
@@ -55,7 +55,7 @@ The three-seed decode comparisons used a 56-token prompt, a fixed 768-token gene
 
 ## Find the original evidence
 
-The host archive is `/data/inkling-perf-lab/nov23-evening/`. GitHub carries the source patches, the portable launcher and clients, and the per-request counters and digests. The archive retains full graded responses, transcripts, raw binary score arrays, experimental source trees and local build logs. [Published measurement files](../bench/results/)
+The full evening archive stays on the benchmark host. GitHub carries the source patches, the portable launcher and clients, and the per-request counters and digests. The archive retains full graded responses, transcripts, raw binary score arrays, experimental source trees and local build logs. [Published measurement files](../bench/results/)
 
 | Question | Location inside the archive |
 |---|---|
