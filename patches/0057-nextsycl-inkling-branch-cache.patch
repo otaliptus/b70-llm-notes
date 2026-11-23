@@ -1,0 +1,356 @@
+diff --git a/glue/serve/src/cache.rs b/glue/serve/src/cache.rs
+index 0dedc20..a79bdf8 100644
+--- a/glue/serve/src/cache.rs
++++ b/glue/serve/src/cache.rs
+@@ -79,7 +79,44 @@ pub enum Hit {
+     Disk(usize),
+ }
+ 
++/// Only resident checkpoints participate. Identifiers stay valid while at least one
++/// checkpoint owns the allocation; a disk entry has its own serialized bytes.
++#[derive(Default)]
++struct ResidentMemory {
++    bytes: usize,
++    references: std::collections::HashMap<usize, usize>,
++}
++
++impl ResidentMemory {
++    fn insert(&mut self, ck: &Checkpoint) {
++        let mut added = ck.bytes();
++        ck.visit_shared(&mut |id, bytes| {
++            let count = self.references.entry(id).or_default();
++            if *count > 0 {
++                added -= bytes;
++            }
++            *count += 1;
++        });
++        self.bytes += added;
++    }
++
++    fn remove(&mut self, ck: &Checkpoint) {
++        let mut removed = ck.bytes();
++        ck.visit_shared(&mut |id, bytes| {
++            let count = self.references.get_mut(&id).expect("resident checkpoint allocation");
++            *count -= 1;
++            if *count == 0 {
++                self.references.remove(&id);
++            } else {
++                removed -= bytes;
++            }
++        });
++        self.bytes -= removed;
++    }
++}
++
+ pub struct PromptCache {
++    memory: ResidentMemory,
+     entries: Vec<Entry>,
+     budget: usize,
+     clock: u64,
+@@ -89,7 +126,7 @@ pub struct PromptCache {
+ 
+ impl PromptCache {
+     pub fn new(budget: usize) -> PromptCache {
+-        PromptCache { entries: Vec::new(), budget, clock: 0, evictions: 0, disk: None }
++        PromptCache { memory: ResidentMemory::default(), entries: Vec::new(), budget, clock: 0, evictions: 0, disk: None }
+     }
+ 
+     /// A disk tier of `budget` bytes under `root`, in the subdirectory of `fingerprint` (what a checkpoint must
+@@ -166,7 +203,7 @@ impl PromptCache {
+     }
+ 
+     pub fn bytes(&self) -> usize {
+-        self.entries.iter().map(|e| e.ck.bytes()).sum()
++        self.memory.bytes
+     }
+ 
+     /// (checkpoints, bytes, budget) on disk
+@@ -187,6 +224,7 @@ impl PromptCache {
+     pub fn clear(&mut self) -> usize {
+         let mut n = self.entries.len();
+         self.entries.clear();
++        self.memory = ResidentMemory::default();
+         if let Some(d) = &mut self.disk {
+             n += d.entries.len();
+             for e in d.entries.drain(..) {
+@@ -257,15 +295,20 @@ impl PromptCache {
+     /// Keeps `ck` for `tokens`, making room by moving the least recently used to disk (or dropping them without a
+     /// disk tier). A checkpoint larger than the whole memory budget goes straight to disk (or is dropped).
+     pub fn put(&mut self, tokens: Vec<u32>, ck: Checkpoint) -> bool {
+-        self.entries.retain(|e| e.tokens != tokens);
++        if let Some(i) = self.entries.iter().position(|e| e.tokens == tokens) {
++            let old = self.entries.swap_remove(i);
++            self.memory.remove(&old.ck);
++        }
+         if ck.bytes() > self.budget {
+             let c = self.clock + 1;
+             self.clock = c;
+             return self.spill(Entry { tokens, ck, used: c });
+         }
+-        while self.bytes() + ck.bytes() > self.budget {
++        self.memory.insert(&ck);
++        while self.bytes() > self.budget {
+             let Some((i, _)) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.used) else { break };
+             let e = self.entries.swap_remove(i);
++            self.memory.remove(&e.ck);
+             self.evictions += 1;
+             self.spill(e);
+         }
+@@ -277,6 +320,7 @@ impl PromptCache {
+     /// Every checkpoint still in memory onto the disk tier (a stop: the next server takes them back); how many
+     pub fn persist_all(&mut self) -> usize {
+         let v = std::mem::take(&mut self.entries);
++        self.memory = ResidentMemory::default();
+         v.into_iter().map(|e| self.spill(e)).filter(|w| *w).count()
+     }
+ 
+@@ -360,6 +404,48 @@ mod tests {
+         d
+     }
+ 
++    struct SharedTestState {
++        base: std::sync::Arc<Vec<u8>>,
++        private: usize,
++    }
++    impl nextsycl_llm::CheckpointState for SharedTestState {
++        fn pos(&self) -> usize { 1 }
++        fn bytes(&self) -> usize { self.base.len() + self.private }
++        fn visit_shared(&self, visit: &mut dyn FnMut(usize, usize)) {
++            visit(std::sync::Arc::as_ptr(&self.base) as usize, self.base.len());
++        }
++        fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> { w.write_all(&self.base) }
++        fn as_any(&self) -> &dyn std::any::Any { self }
++    }
++
++    #[test]
++    fn shared_prefixes_follow_last_resident_reference() {
++        let mut cache = PromptCache::new(115);
++        let base = std::sync::Arc::new(vec![0; 100]);
++        let child = |private| Checkpoint::new(SharedTestState { base: base.clone(), private });
++        assert!(cache.put(vec![0], child(3)));
++        assert!(cache.put(vec![0, 1], child(4)));
++        assert!(cache.put(vec![0, 2], child(7)));
++        assert_eq!((cache.bytes(), cache.evictions), (114, 0));
++        assert!(cache.put(vec![0, 1], child(3)));
++        assert_eq!(cache.bytes(), 113);
++        assert!(cache.put(vec![0, 3], child(5)));
++        assert_eq!((cache.bytes(), cache.evictions), (115, 1));
++        let own = Checkpoint::new(SharedTestState { base: std::sync::Arc::new(vec![1; 40]), private: 4 });
++        assert!(cache.put(vec![5], own));
++        assert_eq!((cache.bytes(), cache.evictions), (44, 4));
++        assert!(!cache.put(vec![5], child(16)));
++        assert_eq!(cache.bytes(), 0);
++        assert!(cache.put(vec![4], child(0)));
++        assert_eq!(cache.clear(), 1);
++        assert_eq!(cache.bytes(), 0);
++        assert!(cache.put(vec![0], child(6)));
++        assert_eq!(cache.persist_all(), 0);
++        assert_eq!(cache.bytes(), 0);
++        assert!(cache.put(vec![0], child(6)));
++        assert_eq!(cache.bytes(), 106);
++    }
++
+     #[test]
+     fn the_drive_free_space_is_read() {
+         let d = temp("avail");
+diff --git a/kernels/llm/inkling2/silo/dec.cpp b/kernels/llm/inkling2/silo/dec.cpp
+index ac4f54d..df9000b 100644
+--- a/kernels/llm/inkling2/silo/dec.cpp
++++ b/kernels/llm/inkling2/silo/dec.cpp
+@@ -420,6 +420,36 @@ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, cons
+     NS_CATCH
+ }
+ 
++int ns_ink2s_conv_keep_many(ns_gpu* g, int slots, const float* const* snapshots, float* const* states, const int64_t* widths, int keep, int max_rows) {
++    NS_TRY
++    constexpr int max_slots = 16;
++    if (slots < 1 || slots > max_slots || keep < 0 || keep > max_rows)
++        return ns_fail("ns_ink2s_conv_keep_many: invalid slot or row count");
++    struct Copies {
++        const float* snap[max_slots];
++        float* state[max_slots];
++        int64_t end[4], offset[4];
++    } cp{};
++    for (int s = 0; s < slots; ++s) {
++        cp.snap[s] = snapshots[s];
++        cp.state[s] = states[s];
++    }
++    int64_t channels = 0;
++    for (int j = 0; j < 4; ++j) {
++        cp.offset[j] = max_rows * channels + keep * widths[j];
++        channels += widths[j];
++        cp.end[j] = channels * 3;
++    }
++    g->q.parallel_for(sycl::range<2>(slots, channels * 3), [=](sycl::id<2> id) {
++        const int s = id[0];
++        const int64_t i = id[1];
++        const int j = i < cp.end[1] ? (i < cp.end[0] ? 0 : 1) : (i < cp.end[2] ? 2 : 3);
++        cp.state[s][i] = cp.snap[s][i + cp.offset[j]];
++    });
++    return 0;
++    NS_CATCH
++}
++
+ // up to 4 controllers in one launch (the three attention inputs of a looped layer)
+ struct CtrlJobs {
+     const float* cur[4];
+diff --git a/kernels/llm/inkling2/silo/silo.h b/kernels/llm/inkling2/silo/silo.h
+index f2e1e12..5998663 100644
+--- a/kernels/llm/inkling2/silo/silo.h
++++ b/kernels/llm/inkling2/silo/silo.h
+@@ -154,6 +154,8 @@ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, cons
+ /* Optional long-context merge; scratch holds T * Hq * (ns + 1) floats. */
+ int ns_ink2s_merge_exact(ns_gpu* g, const float* part, const float* sink, const float* gate, float* out, void* xq, int64_t T, int64_t Hq, int64_t ns, float* scratch);
+ /* (sink null: none; gate null: not gated) */
++/* Restore the four convolution groups of up to 16 slots after a speculative rollback. */
++int ns_ink2s_conv_keep_many(ns_gpu* g, int slots, const float* const* snapshots, float* const* states, const int64_t* widths, int keep, int max_rows);
+ /* a loop controller: u [T, rank] = down [rank, 2C] . [rms(cur) | rms(msg)] (eps), then out [T, C] = cur - tanh(forget .
+  * u) cur + tanh(gain . u) msg (gain, forget [C, rank]; rank at most 64) */
+ int ns_ink2s_ctrl_down(ns_gpu* g, const float* cur, const float* msg, const float* down, float* u, int64_t T, int64_t C, int64_t rank, float eps);
+diff --git a/llm/contract/src/lib.rs b/llm/contract/src/lib.rs
+index 77c3a43..962faf2 100644
+--- a/llm/contract/src/lib.rs
++++ b/llm/contract/src/lib.rs
+@@ -137,6 +137,9 @@ pub trait CheckpointState: Any + Send {
+     fn pos(&self) -> usize;
+     /// host bytes held
+     fn bytes(&self) -> usize;
++    /// Visit each shared allocation counted in `bytes`, using its address as an identity
++    /// while the checkpoint is alive. Each visit reports the full allocation size.
++    fn visit_shared(&self, _visit: &mut dyn FnMut(usize, usize)) {}
+     /// as a file (the prompt cache's disk tier; its engine's `read_checkpoint` reads it back)
+     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()>;
+     fn as_any(&self) -> &dyn Any;
+@@ -154,6 +157,9 @@ impl Checkpoint {
+     pub fn bytes(&self) -> usize {
+         self.0.bytes()
+     }
++    pub fn visit_shared(&self, visit: &mut dyn FnMut(usize, usize)) {
++        self.0.visit_shared(visit)
++    }
+     pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+         self.0.write_to(w)
+     }
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index d79b537..c557ad0 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -280,6 +280,12 @@ pub struct Checkpoint {
+ const CK_MAGIC: &[u8; 6] = b"NSINK1";
+ 
+ impl Checkpoint {
++    pub(crate) fn visit_shared(&self, visit: &mut dyn FnMut(usize, usize)) {
++        for buf in self.bufs.iter() {
++            buf.visit_shared(visit);
++        }
++    }
++
+     pub fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+         let u = |w: &mut dyn std::io::Write, x: usize| w.write_all(&(x as u64).to_le_bytes());
+         w.write_all(CK_MAGIC)?;
+@@ -1775,6 +1781,21 @@ impl<'g> Inkling2<'g> {
+     /// Every slot's convolution states as after the first `keep` rows of the last decode pass
+     fn conv_keep(&self, s: &Session, keep: usize) -> Result<()> {
+         let groups = self.g.conv_groups();
++        if let Some(copy) = self.silo.and_then(|sl| sl.fused.conv_keep_many) {
++            let widths = groups.map(|c| c as i64);
++            for slots in s.slots.chunks(16) {
++                let mut snap = [std::ptr::null(); 16];
++                let mut state = [std::ptr::null_mut(); 16];
++                for (i, sl) in slots.iter().enumerate() {
++                    snap[i] = sl.snap.fp();
++                    state[i] = sl.conv.fp();
++                }
++                // SAFETY: each slot holds all four groups, with three history rows and MAXV snapshot rows.
++                self.op("conv keep", || unsafe { copy(self.raw(), slots.len() as i32, snap.as_ptr(), state.as_ptr(),
++                                                     widths.as_ptr(), keep as i32, MAXV as i32) })?;
++            }
++            return Ok(());
++        }
+         for sl in &s.slots {
+             let mut off = 0;
+             for &ch in &groups {
+diff --git a/llm/inkling2/src/engine/checkpoint.rs b/llm/inkling2/src/engine/checkpoint.rs
+index cb1e1aa..68eacdb 100644
+--- a/llm/inkling2/src/engine/checkpoint.rs
++++ b/llm/inkling2/src/engine/checkpoint.rs
+@@ -34,7 +34,7 @@ impl BufferImage {
+     }
+ 
+     // A sliding window can retain part of an interval. Charge the full allocation to
+-    // this checkpoint. Shared intervals in two entries are charged to each entry.
++    // this checkpoint; the server accounts for sharing between resident entries.
+     pub(super) fn held(&self) -> usize {
+         match self {
+             Self::Bytes(b) => b.len(),
+@@ -42,6 +42,14 @@ impl BufferImage {
+         }
+     }
+ 
++    pub(super) fn visit_shared(&self, visit: &mut dyn FnMut(usize, usize)) {
++        if let Self::Ring(r) = self {
++            for band in &r.bands {
++                visit(Arc::as_ptr(&band.data) as usize, band.data.len());
++            }
++        }
++    }
++
+     pub(super) fn bytes(&self) -> Result<&[u8]> {
+         match self {
+             Self::Bytes(b) => Ok(b),
+diff --git a/llm/inkling2/src/ffi.rs b/llm/inkling2/src/ffi.rs
+index 81b6ad7..9a66ff0 100644
+--- a/llm/inkling2/src/ffi.rs
++++ b/llm/inkling2/src/ffi.rs
+@@ -205,6 +205,7 @@ pub struct Fused {
+     pub post_qkv: unsafe extern "C" fn(G, *const Qkv) -> c_int,
+     /// (part, sink, gate, out, xq, T, Hq, ns)
+     pub merge_gate_xq: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64) -> c_int,
++    pub conv_keep_many: Option<unsafe extern "C" fn(G, c_int, *const *const f32, *const *mut f32, *const i64, c_int, c_int) -> c_int>,
+     pub merge_exact: Option<unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, M, i64, i64, i64, *mut f32) -> c_int>,
+     /// (cur, msg, down, u, T, C, rank, eps)
+     pub ctrl_down: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
+@@ -295,6 +296,14 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+                 }
+             }};
+         }
++        macro_rules! optional {
++            ($name:literal) => {{
++                let ptr = lib.symbol($name);
++                // SAFETY: optional entry point with the field's signature in silo.h.
++                #[allow(clippy::missing_transmute_annotations)]
++                (!ptr.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, _>(ptr) })
++            }};
++        }
+         Ok(Silo {
+             path: lib.path.clone(),
+             xq_bytes: sym!("ns_ink2s_xq_bytes"),
+@@ -333,12 +342,8 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+                 conv_res: sym!("ns_ink2s_conv_res"),
+                 post_qkv: sym!("ns_ink2s_post_qkv"),
+                 merge_gate_xq: sym!("ns_ink2s_merge_gate_xq"),
+-                merge_exact: {
+-                    let ptr = lib.symbol("ns_ink2s_merge_exact");
+-                    // SAFETY: optional entry point with the signature declared in silo.h.
+-                    #[allow(clippy::missing_transmute_annotations)]
+-                    (!ptr.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, _>(ptr) })
+-                },
++                merge_exact: optional!("ns_ink2s_merge_exact"),
++                conv_keep_many: optional!("ns_ink2s_conv_keep_many"),
+                 ctrl_down: sym!("ns_ink2s_ctrl_down"),
+                 ctrl_down_many: sym!("ns_ink2s_ctrl_down_many"),
+                 ctrl_apply_many: sym!("ns_ink2s_ctrl_apply_many"),
+diff --git a/llm/inkling2/src/lib.rs b/llm/inkling2/src/lib.rs
+index 1e8dc01..d04c993 100644
+--- a/llm/inkling2/src/lib.rs
++++ b/llm/inkling2/src/lib.rs
+@@ -77,6 +77,9 @@ impl CheckpointState for engine::Checkpoint {
+     fn bytes(&self) -> usize {
+         self.bytes
+     }
++    fn visit_shared(&self, visit: &mut dyn FnMut(usize, usize)) {
++        engine::Checkpoint::visit_shared(self, visit);
++    }
+     fn write_to(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+         engine::Checkpoint::write_to(self, w)
+     }

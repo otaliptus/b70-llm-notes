@@ -18,6 +18,14 @@ At each of 192 continuation positions, the runtime exported all 200,058 target l
 
 At 126,458 input tokens, patch 0056 generated **47.6 tok/s** on a cold source-reading request. The default launcher now allows 6 GiB of host RAM for prompt checkpoints. The 4 GiB setting could retain only a shorter checkpoint. Its two follow-ups reread over 56,000 tokens each. With 6 GiB the same turns read 262 and 158 fresh tokens, and time to first token fell from **47.25 to 1.19 seconds** and **52.12 to 1.14 seconds**. Decode on the two follow-ups measured 51.8 and 41.6 tok/s. The cold answer and first follow-up matched exactly. The last prompt contained the same tokens but produced two differently worded checklists (620 and 503 generated tokens). The 4 GiB run reconstructed more of its state by prefill. Both runs used the same weights, GPU context allocation and seed. Set `PROMPT_CACHE_MIB` to choose the host memory budget. [Per-turn measurements and output hashes](../bench/results/inkling-native-near-context-limit.csv)
 
+With both engines given the same 6 GiB host cache, all three replies, generated lengths and proposal counts matched. Patch 0054 averaged **18.58 decode tok/s** and **914 cold prefill tok/s**. Patch 0056 averaged **45.90 decode tok/s** and **1,449 cold prefill tok/s** on those requests. The last checklist also matched its counterpart in this equal-budget comparison. [126K request counters](../bench/results/inkling-native-near-context-limit.csv)
+
+## Switching conversation branches with patch 0057
+
+A five-request test started with 39,323 source tokens, added a different appendix to each of two branches and revisited both. Under a 2,560 MiB host-cache budget the previous server evicted 11 checkpoints. Patch 0057 counts a shared allocation once while any resident branch references it. All eight final checkpoints fit in 2,234 MiB. The return to branch A read 15 fresh tokens in place of 43,563, reducing time to first token from **24.73 to 0.40 seconds**. The return to B read 18 in place of 43,980, going from **24.81 to 0.43 seconds**. All requests reached the 196-token cap during reasoning, so this fixture measures cache behavior. [Cache counters for all five requests](../bench/results/inkling-native-branch-cache.csv)
+
+The same patch batches convolution history repair after the verifier rejects a proposed suffix. Three fixed 768-token generations matched in full and ran at 116.6, 120.9 and 124.0 tok/s with batched repair. Apply 0057 after 0056 and rebuild the executable and Inkling silo. The on-disk checkpoint format is compatible. [Runtime patch](../patches/0057-nextsycl-inkling-branch-cache.patch)
+
 ## Workloads and compaction with patch 0056
 
 | Workload | Requests | Fresh prefill tok/s | Decode tok/s | Original decode tok/s |
