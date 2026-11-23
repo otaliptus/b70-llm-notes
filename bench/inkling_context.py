@@ -1,4 +1,4 @@
-"""Replay the Inkling B70 source-reading and branching conversations against nextsycl."""
+"""Replay the Inkling B70 conversations and compaction checks against nextsycl."""
 import argparse
 import hashlib
 import json
@@ -35,6 +35,40 @@ INTRO = (
     "when the caller leaves the context unset what value is used, in which order are prompt chunk sizes tried "
     "automatically, and how much memory is reserved as a margin? Give the actual numbers and separate context size "
     "from chunk size. The material below contains the loader and its supporting implementation.\n\n"
+)
+
+
+CHAT_TURNS = (
+    ("hey, i'm trying to get a little zine swap going at our community room. never hosted "
+     "anything before. is this doable with just two of us?"),
+    ("We're thinking Saturday 6 June, 2–4 pm at Maple Room. Free entry. Room limit 30, but that "
+     "includes me and Jules who are hosting. I'd like a quiet corner. Can you sketch something "
+     "simple?"),
+    ("Nice. How many visitor places can I actually offer? I always mess up the bit about whether "
+     "the hosts count."),
+    ("I can spend £75. Printing is £18, tea and biscuits £22, and sign holders £9. What's left? "
+     "I'd like to keep a bit for things I forget."),
+    ("Let's turn that into a friendly invite. Short enough to send in the group chat, no big "
+     "promotional voice, and make clear you can just browse."),
+    ("Actually the caretaker just texted: “Maple is fine but maximum 24 people including any "
+     "organisers. Door opens to you at 1:30. Keep the side exit clear.” What do I need to change?"),
+    ("Can you undo the old number in the invite and send me just the new wording? Don't mention "
+     "the old cap."),
+    ("Unrelated for a sec, what's a zine in plain English? My neighbour asked and I realised my "
+     "explanation made it sound way more complicated than it is."),
+    ("Right, back to Saturday. Jules can only stay until 3. Priya will take over at 3, with no "
+     "overlap in the room. Give me the simplest host handover, in three bullets."),
+    ("We don't need sign holders after all, Jules is borrowing some. Tea and biscuits actually "
+     "came to £27. Printing is still £18. What can I spend now without going over budget?"),
+    ("I got a question from Lee: “I don't have anything to trade, can I still come? And I find "
+     "loud rooms rough.” Could you help me reply without promising total silence?"),
+    ("Okay, now a one-line reminder for my phone for setup time. Include the little detail about "
+     "the exit because I know I'll forget."),
+    ("I'm going to lose this chat. Write a handoff for Priya in under 80 words. Keep the final "
+     "date, public hours, room, visitor limit, swap time for the hosts and money left. This is "
+     "for her, so drop the backstory."),
+    ("Quick check from memory: if all the visitor places are booked and both hosts are inside at "
+     "2:15, is there room for two walk-ins? Just tell me what to say at the door."),
 )
 
 
@@ -146,6 +180,22 @@ def compaction(request):
                           "summary_words": [len(one.split()), len(two.split())]}), flush=True)
 
 
+def conversation(request):
+    history = []
+    previous = ""
+    for index, text in enumerate(CHAT_TURNS):
+        if index == 4 and "£26" in previous:
+            text = "Good, I’ll leave that £26 alone for now. " + text
+        if index == 10 and ("£30" in previous or "30 pounds" in previous.lower()):
+            text = "Great, £30 is enough cushion. " + text
+        history.append(user(text))
+        reply = request(f"turn-{index + 1:02}", history, 630 + index, 1800)
+        history.append(reply)
+        previous = reply["content"]
+        if index + 1 < len(CHAT_TURNS):
+            time.sleep((1.1, 1.8, 1.4, 2.2)[index % 4])
+
+
 def replay(case, prompt, request):
     if case == "branches":
         root = [user(prompt[:98138] + "\nSummarize the main point in one sentence.")]
@@ -174,12 +224,17 @@ def replay(case, prompt, request):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, help="fixture source checkout with only patch 0054 applied")
-    parser.add_argument("--case", choices=("100k", "126k", "branches", "compaction"), default="100k")
+    parser.add_argument("--case", choices=("100k", "126k", "branches", "compaction", "chat"), default="100k")
     parser.add_argument("--server", default="http://127.0.0.1:18081", help="nextsycl server root URL")
     parser.add_argument("--key-file", type=Path, default=os.getenv("API_KEY_FILE"))
     parser.add_argument("--prepare-only", action="store_true", help="verify the source fixture and exit before contacting the server")
     args = parser.parse_args()
-    if args.case == "compaction":
+    if args.case == "chat":
+        if args.prepare_only:
+            print(digest("\n".join(CHAT_TURNS)))
+            return
+        prompt = ""
+    elif args.case == "compaction":
         if args.prepare_only:
             for seed in (177, 178):
                 first, second, _ = compaction_fixture(seed)
@@ -201,7 +256,9 @@ def main():
         rows.append(row)
         return reply
 
-    if args.case == "compaction":
+    if args.case == "chat":
+        conversation(request)
+    elif args.case == "compaction":
         compaction(request)
     else:
         replay(args.case, prompt, request)

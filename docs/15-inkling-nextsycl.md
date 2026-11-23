@@ -8,9 +8,27 @@ The installed release selected an 8,192-token batch with a 131,072-token allocat
 
 Simply increasing the prompt batch from 2,048 to 8,192 takes the cold wait down to 51.3 seconds, but oneMKL then sees different matrix shapes. In three independent executions on prefixes of the same source, top-token agreement with the 2,048 reference fell to 81.2%, 88.0% and 91.7%. The 0059 implementation expands each expert's weights once per wide batch and applies them to the same groups of rows used by the 2,048-token reference. It also preserves the decode-width kernel for a short final group.
 
-With wide staging and reference-sized products, **115,233,408 full-vocabulary target scores were byte-identical** across the three executions. Another 4,801,392 scores matched on 4,097-, 4,112- and 4,113-token inputs that straddle the decode-width boundary. A separate 98K logistics log and 51-token continuation had 100% top-token agreement and mean KL of 0.00000 at the reported precision. All 28 fixed-seed everyday, conversation, source and compaction replies matched 0058 in visible text and generated length. Both twice-compacted handoffs retained five of five requested facts. [Quality measurements and file hashes](../bench/results/inkling-native-prefill-quality.csv)
+With wide staging and reference-sized products, **115,233,408 full-vocabulary target scores were byte-identical** across the three executions. Another 4,801,392 scores matched on 4,097-, 4,112- and 4,113-token inputs that straddle the decode-width boundary. A separate 98K logistics log and 51-token continuation had 100% top-token agreement and mean KL of 0.00000 at the reported precision. All 28 fixed-seed everyday, conversation, source and compaction replies matched 0058 in visible text, reasoning digest and generated length. Both twice-compacted handoffs retained five of five requested facts. [Quality measurements and file hashes](../bench/results/inkling-native-prefill-quality.csv)
 
 The B70 launcher enables wide staging. At startup the runtime tries 8,192, 4,096, 2,048, 1,024 and 512 rows and selects the first size that fits its existing memory budget. The actual chunk appears in the load log. `WIDE_PREFILL=0` restores the previous selection policy and `PREFILL_CHUNK` pins a size for a controlled comparison. Wide-batch checkpoints use a distinct disk cache fingerprint. Apply 0059 after 0058 and rebuild the executable. [Runtime patch](../patches/0059-nextsycl-inkling-wide-prefill.patch) · [Launcher](../scripts/serve-inkling-nextsycl.sh)
+
+### User benchmark and conversation on 0059
+
+| Workload | Requests | Fresh prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| Original graded suite | 39 | 531.35 | 105.59 |
+| Everyday tasks | 6 | 1,933.10 | 103.32 |
+| Continuous conversation | 14 | 333.57 | 81.91 |
+| 40K source and follow-up | 2 | 2,072.13 | 81.28 |
+| Two 98K compaction exercises | 6 | 1,878.21 | 66.16 |
+| 100K source and two follow-ups | 3 | 1,722.69 | 53.87 |
+| 126K source and two follow-ups | 3 | 1,633.28 | 46.62 |
+
+The original grader passed **36 of 39** on the automatically configured release, with 58,422 generated tokens and a median of 0.38 seconds to the first streamed token. The failed cases were `r03_trace`, `k05_mem` and `c11_json`. Earlier runs scored 34/39 on 0054 and 35/39 on 0056. The grader samples fresh answers in each run. The fixed-seed workloads below the graded suite give paired comparisons. Throughput divides total fresh or generated tokens by corresponding engine time. Decode includes reasoning and visible output. [Per-request counters, grades and visible-answer hashes](../bench/results/inkling-native-workloads.csv)
+
+A fresh replay of the conversation through the normal installed launcher produced the same 14 visible and reasoning hashes and generated lengths. This run measured 329.35 fresh prefill and 81.82 decode tok/s. [Streaming timings and both output hashes](../bench/results/inkling-native-chat-replay.jsonl)
+
+The fourteen-turn conversation streamed its first token after a median of **0.57 seconds** and its first visible text after **2.56 seconds**. Its 72-word handoff carried forward the revised 22-visitor limit, the host swap at 3 pm and the final £30 budget. An earlier invitation rewrite omitted the revised capacity, so even this short conversation required checking the deliverable. [Conversation runner](../bench/inkling_context.py)
 
 ## Recurrent projections with patch 0058
 
@@ -81,6 +99,8 @@ python3 bench/inkling_context.py --source /tmp/inkling-fixture --case 100k >100k
 
 Restart the single-stream server with an empty prompt cache before each cold case. Use `--case 126k` for the near-limit run or `--case branches` for the five-turn branching workload. The published branching comparison used `PROMPT_CACHE_MIB=2560` and both near-limit controls used 6144. For the two independent compaction exercises, run `python3 bench/inkling_context.py --case compaction`. Each shift supplies a new log of about 98K tokens. Only the model's handoff carries over to the next shift. The final answer is graded against five fields.
 
+To replay the fourteen-turn conversation, run `python3 bench/inkling_context.py --case chat`. It plans a community zine swap, revises the visitor limit and budget, changes hosts halfway through and requests a final handoff. Each turn includes the assistant's actual visible replies. Two follow-ups adapt their wording to the previous answer, and the client pauses between turns.
+
 Per-turn JSON includes fresh and reused tokens, engine read and generation seconds, first generated and first visible text latency, and SHA-256 hashes of the reasoning and answer. The final rates printed to standard error divide total tokens by total engine time. The public runner reproduced all three visible answers, generated lengths and prompt counts from the 100K reference in a 0058 replay. [Replay script](../bench/inkling_context.py)
 
 ## Original native measurements
@@ -107,7 +127,20 @@ OpenDynalmx published a context sweep on a single 32 GB B70 using a vLLM XPU for
 
 ## Reproduce the runtime
 
-Apply patch 0054 to nextsycl commit `e3f1fd891b7fda6f478a326d913d28893a4e9811`, then use nextsycl's oneAPI build for the B70. The launcher expects the built executable beside the LLM shared library and its Inkling silo subdirectory. Set `RUNTIME`, `MODELS` and `API_KEY_FILE` to local paths and `SYCL_IMAGE` to the compatible oneAPI Docker runtime image. Prepare the 32,768-row draft head with the procedure in section 5 of the llama.cpp notes. [Patch](../patches/0054-nextsycl-atomic-inkling-b70.patch) · [Launcher](../scripts/serve-inkling-nextsycl.sh) · [Draft-head preparation](14-inkling-uncensored-dspark.md) · [Upstream source](https://github.com/maxfridbe/nextsycl/tree/e3f1fd891b7fda6f478a326d913d28893a4e9811)
+For the measured release, start with upstream nextsycl commit `e3f1fd891b7fda6f478a326d913d28893a4e9811` and apply patches 0054 through 0059 in numerical order. The source fixtures above use their own checkout. From the notes repository, the following commands prepare the runtime sources and start the upstream B70 build. The upstream build script uses Podman and puts the resulting executable and libraries under `dist/`.
+
+```bash
+notes=$PWD
+runtime_src=/tmp/inkling-runtime
+git clone https://github.com/maxfridbe/nextsycl.git "$runtime_src"
+git -C "$runtime_src" checkout --detach e3f1fd891b7fda6f478a326d913d28893a4e9811
+for number in 0054 0055 0056 0057 0058 0059; do
+    git -C "$runtime_src" apply "$notes"/patches/"$number"-nextsycl-*.patch || exit 1
+done
+AOT=bmg-g31 "$runtime_src/build.sh" all
+```
+
+The launcher expects the built executable beside the LLM shared library and its Inkling silo subdirectory. Set `RUNTIME`, `MODELS` and `API_KEY_FILE` to local paths and `SYCL_IMAGE` to the compatible oneAPI Docker runtime image. Prepare the 32,768-row draft head with the procedure in section 5 of the llama.cpp notes. [Patch](../patches/0054-nextsycl-atomic-inkling-b70.patch) · [Launcher](../scripts/serve-inkling-nextsycl.sh) · [Draft-head preparation](14-inkling-uncensored-dspark.md) · [Upstream source](https://github.com/maxfridbe/nextsycl/tree/e3f1fd891b7fda6f478a326d913d28893a4e9811)
 
 The GPU kernels load the original Q4_K gate/up and Q5_0 down experts. The 32K head supplies up to six DSpark proposals at a draft confidence threshold of 0.65. The target verifies each proposal with full-vocabulary sampling. The patch also adds bearer authentication to the HTTP endpoint. Verification included exact agreement with GGML on 155,520 sampled expert weights expanded to half precision, a full-vocabulary sampling distribution check, and identical generated text across three fixed-seed prompts with the full and reduced proposal heads.
 
