@@ -21,3 +21,15 @@ Apply patch 0054 to nextsycl commit `e3f1fd891b7fda6f478a326d913d28893a4e9811`, 
 The GPU kernels load the original Q4_K gate/up and Q5_0 down experts. The 32K head supplies up to six DSpark proposals at a draft confidence threshold of 0.65. The target verifies each proposal with full-vocabulary sampling. The patch also adds bearer authentication to the HTTP endpoint. Verification included exact agreement with GGML on 155,520 sampled expert weights expanded to half precision, a full-vocabulary sampling distribution check, and identical generated text across three fixed-seed prompts with the full and reduced proposal heads.
 
 The GGUF records 1,048,576 tokens as its context length. The measurements above used the 131,072-token launcher configuration. [Model card](https://thinkingmachines.ai/model-card/inkling-2-mini/)
+
+
+## Follow-up latency at 100K
+
+Patch 0055 lets consecutive Inkling checkpoints share immutable stretches of KV data in host memory. When a session restores the same checkpoint it just saved, its full-attention keys and values are already on the GPU. Branches, cold restores and disk checkpoints keep the original file layout. Apply 0055 after 0054 and rebuild the executable. [Prefix checkpoint patch](../patches/0055-nextsycl-inkling-prefix-checkpoints.patch)
+
+| Follow-up | Reused tokens | Fresh tokens | Previous first token | With shared checkpoints |
+|---|---:|---:|---:|---:|
+| First follow-up | 99,978 | 294 | 3.99 s | 1.36 s |
+| Second follow-up | 100,272 | 142 | 3.83 s | 1.28 s |
+
+This A/B used the same attention binary, weights, sampling settings and seeds on both sides. All three answers and generated token counts matched. A separate six-request branching test using the original attention kernels produced seven byte-identical checkpoint files. Each executable also read the other one's checkpoints and reproduced the same answers. [Request timings and answer hashes](../bench/results/inkling-native-prefix-cache.csv)

@@ -1,0 +1,471 @@
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index 0a4c3a1..7d31219 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -30,7 +30,9 @@ use nextsycl_llm::{Error, GpuInfo, Result, Sampler, Tap};
+ 
+ use crate::ffi;
+ 
++mod checkpoint;
+ mod dspark;
++use checkpoint::{Anchor, BufferImage, restore_ring, save_ring};
+ 
+ fn e(x: impl std::fmt::Display) -> Error {
+     Error(x.to_string())
+@@ -262,12 +264,14 @@ pub struct Session {
+     last_rows: usize,
+     /// the DSpark drafter's caches and f_rnn (a drafter loaded)
+     ds: Option<dspark::DsState>,
++    // A weak reference so clearing the prompt cache releases its host memory.
++    anchor: std::cell::RefCell<Option<Anchor>>,
+ }
+ 
+ /// A conversation's state in host memory: per slot its keys / values still seen, then its convolution state
+ pub struct Checkpoint {
+     pub pos: usize,
+-    bufs: Vec<Vec<u8>>,
++    bufs: Arc<Vec<BufferImage>>,
+     pub bytes: usize,
+ }
+ 
+@@ -279,9 +283,9 @@ impl Checkpoint {
+         w.write_all(CK_MAGIC)?;
+         u(w, self.pos)?;
+         u(w, self.bufs.len())?;
+-        for b in &self.bufs {
++        for b in self.bufs.iter() {
+             u(w, b.len())?;
+-            w.write_all(b)?;
++            b.write_to(w)?;
+         }
+         Ok(())
+     }
+@@ -309,9 +313,9 @@ impl Checkpoint {
+             let mut v = vec![0u8; len];
+             r.read_exact(&mut v)?;
+             bytes += len;
+-            bufs.push(v);
++            bufs.push(BufferImage::Bytes(v));
+         }
+-        Ok(Checkpoint { pos, bufs, bytes })
++        Ok(Checkpoint { pos, bufs: Arc::new(bufs), bytes })
+     }
+ }
+ 
+@@ -1660,10 +1664,11 @@ impl<'g> Inkling2<'g> {
+         }
+         let ds = self.ds_state(max_ctx)?;
+         self.gpu.sync()?;
+-        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0, ds })
++        Ok(Session { pos: 0, max_ctx, slots, last_rows: 0, ds, anchor: Default::default() })
+     }
+ 
+     pub fn reset_session(&self, s: &mut Session) -> Result<()> {
++        s.anchor.take();
+         for sl in &s.slots {
+             sl.conv.fill(0)?;
+         }
+@@ -1697,6 +1702,7 @@ impl<'g> Inkling2<'g> {
+         if src.pos > dst.max_ctx {
+             return Err(e(format!("a session of {} tokens into one of {}", src.pos, dst.max_ctx)));
+         }
++        dst.anchor.take();
+         for (sl, (d, sc)) in dst.slots.iter().zip(&src.slots).enumerate() {
+             let from = Self::kept(self.g.win(sl), src.pos);
+             self.copy_ring(&d.kc, d.cap, &sc.kc, sc.cap, self.g.heads_kv, from, src.pos)?;
+@@ -1741,6 +1747,9 @@ impl<'g> Inkling2<'g> {
+             self.conv_keep(s, keep)?;
+         }
+         s.pos -= s.last_rows - keep;
++        if s.anchor.borrow().as_ref().is_some_and(|(pos, _)| *pos > s.pos) {
++            s.anchor.take();
++        }
+         s.last_rows = keep;
+         Ok(())
+     }
+@@ -1821,32 +1830,25 @@ impl<'g> Inkling2<'g> {
+     pub fn save(&self, s: &Session) -> Result<Checkpoint> {
+         let g = &self.g;
+         let row = g.head * 2;
++        let previous = s.anchor.borrow().as_ref().and_then(|(p, w)| if *p <= s.pos { w.upgrade() } else { None });
+         let mut bufs = Vec::new();
+         for (sl, st) in s.slots.iter().enumerate() {
+             let from = Self::kept(g.win(sl), s.pos);
+-            let n = s.pos - from;
+             for c in [&st.kc, &st.vc] {
+-                let mut b = vec![0u8; g.heads_kv * n * row];
+-                for h in 0..g.heads_kv {
+-                    let mut p = from;
+-                    while p < s.pos {
+-                        let si = p % st.cap;
+-                        let run = (s.pos - p).min(st.cap - si);
+-                        let at = (h * n + p - from) * row;
+-                        c.read((h * st.cap + si) * row, &mut b[at..at + run * row])?;
+-                        p += run;
+-                    }
+-                }
+-                bufs.push(b);
++                let old = previous.as_ref().and_then(|v| v.get(bufs.len()));
++                bufs.push(save_ring(c, st.cap, g.heads_kv, row, from, s.pos, old)?);
+             }
+             let mut cb = vec![0u8; st.conv.len];
+             st.conv.read(0, &mut cb)?;
+-            bufs.push(cb);
++            bufs.push(BufferImage::Bytes(cb));
+         }
+         if let Some(ds) = &s.ds {
+-            bufs.extend(self.ds_save(ds, s.pos, s.last_rows)?);
++            let old = previous.as_ref().and_then(|v| v.get(bufs.len()..));
++            bufs.extend(self.ds_save(ds, s.pos, s.last_rows, old)?);
+         }
+-        let bytes = bufs.iter().map(|b| b.len()).sum();
++        let bytes = bufs.iter().map(BufferImage::held).sum();
++        let bufs = Arc::new(bufs);
++        s.anchor.replace(Some((s.pos, Arc::downgrade(&bufs))));
+         Ok(Checkpoint { pos: s.pos, bufs, bytes })
+     }
+ 
+@@ -1860,36 +1862,28 @@ impl<'g> Inkling2<'g> {
+         if ck.bufs.len() != 3 * s.slots.len() + if s.ds.is_some() { ds_bufs } else { 0 } {
+             return Err(e("a checkpoint of another shape"));
+         }
++        // The exact same saved state can still be present in the full-attention rings of
++        // this session. Windowed rings can wrap while generating the reply.
++        let weak = Arc::downgrade(&ck.bufs);
++        let resident = s.anchor.take().is_some_and(|(pos, w)| pos == ck.pos && pos <= s.pos && w.ptr_eq(&weak));
+         let mut it = ck.bufs.iter();
+         for (sl, st) in s.slots.iter().enumerate() {
+-            let from = Self::kept(g.win(sl), ck.pos);
+-            let n = ck.pos - from;
++            let win = g.win(sl);
++            let from = Self::kept(win, ck.pos);
+             for c in [&st.kc, &st.vc] {
+                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+-                if b.len() != g.heads_kv * n * row {
+-                    return Err(e("a checkpoint of another shape"));
+-                }
+-                for h in 0..g.heads_kv {
+-                    let mut p = from;
+-                    while p < ck.pos {
+-                        let si = p % st.cap;
+-                        let run = (ck.pos - p).min(st.cap - si);
+-                        let at = (h * n + p - from) * row;
+-                        c.write((h * st.cap + si) * row, &b[at..at + run * row])?;
+-                        p += run;
+-                    }
+-                }
++                restore_ring(c, st.cap, g.heads_kv, row, from, ck.pos, b, resident && win == 0)?;
+             }
+-            let cb = it.next().ok_or_else(|| e("a short checkpoint"))?;
++            let cb = it.next().ok_or_else(|| e("a short checkpoint"))?.bytes()?;
+             if cb.len() != st.conv.len {
+                 return Err(e("a checkpoint of another shape"));
+             }
+             st.conv.write(0, cb)?;
+         }
+         if let Some(ds) = s.ds.as_mut() {
+-            let rest: Vec<&Vec<u8>> = it.collect();
+-            self.ds_restore(ds, ck.pos, &rest)?;
++            self.ds_restore(ds, ck.pos, it.as_slice(), resident)?;
+         }
++        s.anchor.replace(Some((ck.pos, weak)));
+         s.pos = ck.pos;
+         s.last_rows = 0;
+         Ok(())
+diff --git a/llm/inkling2/src/engine/checkpoint.rs b/llm/inkling2/src/engine/checkpoint.rs
+new file mode 100644
+index 0000000..4613f28
+--- /dev/null
++++ b/llm/inkling2/src/engine/checkpoint.rs
+@@ -0,0 +1,218 @@
++//! A KV checkpoint stores immutable intervals in host memory. Appending to a session
++//! can share the previous checkpoint's surviving intervals. Each interval holds all
++//! heads, packed by head. The on-disk representation remains one flat array per cache.
++use super::*;
++use std::io::{self, Write};
++use std::sync::Weak;
++
++#[derive(Clone)]
++struct Band {
++    from: usize,
++    end: usize,
++    data: Arc<Vec<u8>>,
++}
++
++pub(super) struct RingImage {
++    heads: usize,
++    row: usize,
++    from: usize,
++    end: usize,
++    bands: Vec<Band>,
++}
++
++pub(super) enum BufferImage {
++    Bytes(Vec<u8>),
++    Ring(RingImage),
++}
++
++impl BufferImage {
++    pub(super) fn len(&self) -> usize {
++        match self {
++            Self::Bytes(b) => b.len(),
++            Self::Ring(r) => r.heads * (r.end - r.from) * r.row,
++        }
++    }
++
++    // A sliding window can retain part of an interval. Charge the full allocation to
++    // this checkpoint. Shared intervals in two entries are charged to each entry.
++    pub(super) fn held(&self) -> usize {
++        match self {
++            Self::Bytes(b) => b.len(),
++            Self::Ring(r) => r.bands.iter().map(|b| b.data.len()).sum(),
++        }
++    }
++
++    pub(super) fn bytes(&self) -> Result<&[u8]> {
++        match self {
++            Self::Bytes(b) => Ok(b),
++            Self::Ring(_) => Err(e("expected a flat checkpoint buffer")),
++        }
++    }
++
++    fn head<E>(
++        &self,
++        h: usize,
++        heads: usize,
++        row: usize,
++        from: usize,
++        end: usize,
++        mut visit: impl FnMut(usize, &[u8]) -> std::result::Result<(), E>,
++    ) -> std::result::Result<(), E> {
++        match self {
++            Self::Bytes(b) => {
++                let n = (end - from) * row;
++                visit(from, &b[h * n..(h + 1) * n])
++            }
++            Self::Ring(r) => {
++                debug_assert_eq!((r.heads, r.row, r.from, r.end), (heads, row, from, end));
++                for band in &r.bands {
++                    let lo = from.max(band.from);
++                    let hi = end.min(band.end);
++                    if lo < hi {
++                        let at = (h * (band.end - band.from) + lo - band.from) * row;
++                        visit(lo, &band.data[at..at + (hi - lo) * row])?;
++                    }
++                }
++                Ok(())
++            }
++        }
++    }
++
++    pub(super) fn write_to(&self, w: &mut dyn Write) -> io::Result<()> {
++        match self {
++            Self::Bytes(b) => w.write_all(b),
++            Self::Ring(r) => {
++                for h in 0..r.heads {
++                    self.head(h, r.heads, r.row, r.from, r.end, |_, b| w.write_all(b))?;
++                }
++                Ok(())
++            }
++        }
++    }
++}
++
++pub(super) type Anchor = (usize, Weak<Vec<BufferImage>>);
++
++pub(super) fn save_ring(
++    buf: &DevBuf,
++    cap: usize,
++    heads: usize,
++    row: usize,
++    from: usize,
++    end: usize,
++    previous: Option<&BufferImage>,
++) -> Result<BufferImage> {
++    let mut bands = Vec::new();
++    let mut start = from;
++    if let Some(BufferImage::Ring(r)) = previous {
++        if r.heads == heads && r.row == row && r.from <= from && r.end >= from && r.end <= end {
++            bands.extend(r.bands.iter().filter(|b| b.end > from).cloned());
++            start = r.end;
++        }
++    }
++    if start < end {
++        let n = end - start;
++        let mut data = vec![0u8; heads * n * row];
++        for h in 0..heads {
++            let mut p = start;
++            while p < end {
++                let slot = p % cap;
++                let count = (end - p).min(cap - slot);
++                let off = (h * n + p - start) * row;
++                buf.read((h * cap + slot) * row, &mut data[off..off + count * row])?;
++                p += count;
++            }
++        }
++        bands.push(Band {
++            from: start,
++            end,
++            data: Arc::new(data),
++        });
++    }
++    Ok(BufferImage::Ring(RingImage {
++        heads,
++        row,
++        from,
++        end,
++        bands,
++    }))
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn restore_ring(
++    buf: &DevBuf,
++    cap: usize,
++    heads: usize,
++    row: usize,
++    from: usize,
++    end: usize,
++    b: &BufferImage,
++    resident: bool,
++) -> Result<()> {
++    if b.len() != heads * (end - from) * row {
++        return Err(e("a checkpoint of another shape"));
++    }
++    if let BufferImage::Ring(r) = b {
++        if (r.heads, r.row, r.from, r.end) != (heads, row, from, end) {
++            return Err(e("a checkpoint of another shape"));
++        }
++    }
++    if !resident {
++        for h in 0..heads {
++            b.head(h, heads, row, from, end, |mut p, mut data| -> Result<()> {
++                while !data.is_empty() {
++                    let slot = p % cap;
++                    let n = (data.len() / row).min(cap - slot);
++                    buf.write((h * cap + slot) * row, &data[..n * row])?;
++                    data = &data[n * row..];
++                    p += n;
++                }
++                Ok(())
++            })?;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn partially_shared_intervals_keep_the_flat_checkpoint_format() {
++        let band = |from: usize, end: usize| {
++            let bytes = (0..2)
++                .flat_map(|h| (from..end).map(move |p| (16 * h + p) as u8))
++                .collect();
++            Band {
++                from,
++                end,
++                data: Arc::new(bytes),
++            }
++        };
++        let image = BufferImage::Ring(RingImage {
++            heads: 2,
++            row: 1,
++            from: 3,
++            end: 8,
++            bands: vec![band(0, 6), band(6, 8)],
++        });
++        assert_eq!(image.len(), 10);
++        assert_eq!(image.held(), 16);
++        let ck = Checkpoint {
++            pos: 8,
++            bytes: image.held(),
++            bufs: Arc::new(vec![image]),
++        };
++        let mut file = Vec::new();
++        ck.write_to(&mut file).unwrap();
++        let loaded = Checkpoint::read_from(&mut file.as_slice()).unwrap();
++        assert_eq!(
++            loaded.bufs[0].bytes().unwrap(),
++            &[3, 4, 5, 6, 7, 19, 20, 21, 22, 23]
++        );
++        let mut again = Vec::new();
++        loaded.write_to(&mut again).unwrap();
++        assert_eq!(file, again);
++    }
++}
+diff --git a/llm/inkling2/src/engine/dspark.rs b/llm/inkling2/src/engine/dspark.rs
+index ed2c6e0..a68a3a9 100644
+--- a/llm/inkling2/src/engine/dspark.rs
++++ b/llm/inkling2/src/engine/dspark.rs
+@@ -311,61 +311,37 @@ impl Inkling2<'_> {
+ 
+     /// The drafter's part of a checkpoint: each layer's keys and values it still reads at `pos`, f_rnn of the last
+     /// committed row
+-    pub(super) fn ds_save(&self, st: &DsState, pos: usize, last_rows: usize) -> Result<Vec<Vec<u8>>> {
++    pub(super) fn ds_save(&self, st: &DsState, pos: usize, last_rows: usize, previous: Option<&[BufferImage]>) -> Result<Vec<BufferImage>> {
+         let Some(d) = &self.ds else { return Ok(Vec::new()) };
+         let row = self.g.head * 2;
+         let mut bufs = Vec::new();
+         for (dl, (kc, vc, cp)) in d.layers.iter().zip(&st.caches) {
+             let from = Self::kept(dl.win, pos);
+-            let n = pos - from;
+             for c in [kc, vc] {
+-                let mut b = vec![0u8; d.heads_kv * n * row];
+-                for h in 0..d.heads_kv {
+-                    let mut p = from;
+-                    while p < pos {
+-                        let si = p % cp;
+-                        let run = (pos - p).min(cp - si);
+-                        let at = (h * n + p - from) * row;
+-                        c.read((h * cp + si) * row, &mut b[at..at + run * row])?;
+-                        p += run;
+-                    }
+-                }
+-                bufs.push(b);
++                let old = previous.and_then(|v| v.get(bufs.len()));
++                bufs.push(save_ring(c, *cp, d.heads_kv, row, from, pos, old)?);
+             }
+         }
+         let c = self.g.n_embd;
+         let r = if st.frnn_all { last_rows.saturating_sub(1) } else { 0 };
+         let mut fb = vec![0u8; c * 4];
+         st.frnn.read(r * c * 4, &mut fb)?;
+-        bufs.push(fb);
++        bufs.push(BufferImage::Bytes(fb));
+         Ok(bufs)
+     }
+ 
+-    pub(super) fn ds_restore(&self, st: &mut DsState, pos: usize, bufs: &[&Vec<u8>]) -> Result<()> {
++    pub(super) fn ds_restore(&self, st: &mut DsState, pos: usize, bufs: &[BufferImage], resident: bool) -> Result<()> {
+         let Some(d) = &self.ds else { return Ok(()) };
+         let row = self.g.head * 2;
+         let mut it = bufs.iter();
+         for (dl, (kc, vc, cp)) in d.layers.iter().zip(&st.caches) {
+             let from = Self::kept(dl.win, pos);
+-            let n = pos - from;
+             for c in [kc, vc] {
+                 let b = it.next().ok_or_else(|| e("a short checkpoint"))?;
+-                if b.len() != d.heads_kv * n * row {
+-                    return Err(e("a checkpoint of another shape"));
+-                }
+-                for h in 0..d.heads_kv {
+-                    let mut p = from;
+-                    while p < pos {
+-                        let si = p % cp;
+-                        let run = (pos - p).min(cp - si);
+-                        let at = (h * n + p - from) * row;
+-                        c.write((h * cp + si) * row, &b[at..at + run * row])?;
+-                        p += run;
+-                    }
+-                }
++                restore_ring(c, *cp, d.heads_kv, row, from, pos, b, resident && dl.win == 0)?;
+             }
+         }
+-        let fb = it.next().ok_or_else(|| e("a short checkpoint"))?;
++        let fb = it.next().ok_or_else(|| e("a short checkpoint"))?.bytes()?;
+         if fb.len() != self.g.n_embd * 4 {
+             return Err(e("a checkpoint of another shape"));
+         }
