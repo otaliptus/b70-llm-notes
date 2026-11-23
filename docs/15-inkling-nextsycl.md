@@ -1,5 +1,7 @@
 # Native Inkling on one Arc Pro B70
 
+For the exact model and runtime files, the command for the 39-task grader, and the experiments that stayed out of the release, see the [November 23 experiment record](16-inkling-b70-experiment-log.md).
+
 ## Wider prefill with patch 0059
 
 On a cold 99,978-token source prompt, the B70 read **1,770 tokens/s** with patch 0059. Patch 0058 read **1,546 tokens/s**. The first generated token arrived in **56.68 seconds**, down from 64.82. Across three turns, the reasoning, visible text and generated lengths matched for each response, totaling 1,254 generated tokens. Pooled decode measured **53.87 tok/s**. [Per-request measurements](../bench/results/inkling-native-workloads.csv)
