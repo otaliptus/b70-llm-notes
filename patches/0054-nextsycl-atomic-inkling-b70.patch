@@ -1,0 +1,748 @@
+diff --git a/glue/serve/src/serve.rs b/glue/serve/src/serve.rs
+index 82204cf..f24760e 100644
+--- a/glue/serve/src/serve.rs
++++ b/glue/serve/src/serve.rs
+@@ -84,6 +84,7 @@ pub struct Server {
+     /// each session's context
+     slot_ctx: Vec<usize>,
+     pub default_effort: Effort,
++    api_key: Option<String>,
+     /// the requests waiting for a session, and the engine's wake-up
+     queue: Mutex<VecDeque<Job>>,
+     wake: std::sync::Condvar,
+@@ -370,7 +371,7 @@ impl nextsycl_llm::Sampler for ServeSampler<'_> {
+         self.temp <= 0.0 && self.k.is_none() && self.force.is_none()
+     }
+     fn device(&self) -> Option<nextsycl_llm::DeviceSampling> {
+-        (self.temp > 0.0 && self.k.is_none() && self.force.is_none()).then_some(nextsycl_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
++        (self.temp > 0.0 && self.k.is_none() && self.force.is_none() && (self.top_p >= 1.0 || !nextsycl_llm::sampling::full_vocab())).then_some(nextsycl_llm::DeviceSampling { temperature: self.temp, top_p: self.top_p, seed: self.seed })
+     }
+ }
+ 
+@@ -555,7 +556,13 @@ impl Server {
+             _ => None,
+         };
+         let think_budget = std::env::var("NS_THINK_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0 && think_end.is_some());
+-        Ok(Server { engine, tok, chat, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
++        let api_key = std::env::var_os("NS_API_KEY_FILE").map(|path| {
++            let secret = std::fs::read_to_string(path).map_err(|_| String::from("cannot read the API key file"))?;
++            let secret = secret.trim();
++            if secret.is_empty() { return Err(String::from("empty API key file")); }
++            Ok(secret.to_owned())
++        }).transpose()?;
++        Ok(Server { api_key, engine, tok, chat, name, max_ctx, slot_ctx, default_effort, queue: Mutex::new(VecDeque::new()), wake: std::sync::Condvar::new(),
+                     inflight: AtomicU64::new(0), parallel, default_max, think_budget, think_end, cache: Mutex::new(cache),
+                     live_lens: Mutex::new(vec![0; parallel]), started: Instant::now(), loaded_at: crate::idle::wall(), last_end: Mutex::new(None), running: Mutex::new(Default::default()),
+                     done: Mutex::new(VecDeque::new()), next_id: AtomicU64::new(1), keep, tele, cors })
+@@ -684,6 +691,15 @@ impl Server {
+             Err(_) => return,
+         }) else { return };
+         let (method, path) = (req.method.as_str(), req.path.as_str());
++        if s.kind() != "socket" && path != "/health" && method != "OPTIONS" {
++            if let Some(expected) = &self.api_key {
++                let valid = http::header(&req.head, "authorization")
++                    .is_some_and(|h| h.strip_prefix("Bearer ") == Some(expected.as_str()));
++                if !valid {
++                    return respond(&mut s, 401, &json!({"error":{"message":"A bearer token is required","type":"invalid_api_key"}}));
++                }
++            }
++        }
+         // the control routes answer on the socket only: the API port may be open to the network
+         if path.starts_with("/server/") && s.kind() != "socket" {
+             return respond(&mut s, 404, &json!({"error": {"message": format!("no route {method} {path} (the control routes are on the server's socket)")}}));
+@@ -806,7 +822,7 @@ impl Server {
+         Ok(Ask { messages, tools, effort,
+                  max: req["max_tokens"].as_u64().or_else(|| req["max_completion_tokens"].as_u64()).map(|n| n as usize),
+                  temp: req["temperature"].as_f64().unwrap_or(1.0) as f32,
+-                 top_p: req["top_p"].as_f64().unwrap_or(0.95) as f32,
++                 top_p: req["top_p"].as_f64().unwrap_or(if nextsycl_llm::sampling::full_vocab() { 1.0 } else { 0.95 }) as f32,
+                  stream: req["stream"].as_bool().unwrap_or(api == Api::Lines),
+                  logprobs: match &req["logprobs"] {
+                      Value::Bool(true) => Some(req["top_logprobs"].as_u64().unwrap_or(0).min(20) as usize),
+diff --git a/kernels/llm/inkling2/ink.cpp b/kernels/llm/inkling2/ink.cpp
+index 50b1785..cde005c 100644
+--- a/kernels/llm/inkling2/ink.cpp
++++ b/kernels/llm/inkling2/ink.cpp
+@@ -717,6 +717,100 @@ int ns_ink2_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n
+     NS_CATCH
+ }
+ 
++// Full-vocabulary sampling at top_p=1. Each tile records its max and shifted sum. Draw a
++// tile by its probability mass, then draw inside it. Both counters depend on the token's
++// absolute position so verifying a block uses the same draws as verifying its rows singly.
++int ns_ink2_sample_full(ns_gpu* g, const float* logits, int32_t* out, float* workspace, int64_t rows, int64_t vocab,
++                        float temperature, uint64_t seed, int64_t pos0) {
++    NS_TRY
++    constexpr int W = 256, TILE = 1024;
++    if (rows < 1 || vocab < 1 || !(temperature > 0.0f)) return ns_fail("invalid full-vocabulary sampling dimensions");
++    const int64_t tiles = (vocab + TILE - 1) / TILE;
++    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * tiles * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) {
++        const auto group = it.get_group();
++        const int64_t index = it.get_group(0), row = index / tiles, tile = index % tiles;
++        const int lane = it.get_local_id(0);
++        const float* x = logits + row * vocab;
++        float values[TILE/W], maximum = -INFINITY;
++#pragma unroll
++        for (int j = 0; j < TILE/W; ++j) {
++            const int64_t i = tile * TILE + lane + j * W;
++            values[j] = i < vocab ? x[i] : -INFINITY;
++            maximum = sycl::fmax(maximum, values[j]);
++        }
++        maximum = sycl::reduce_over_group(group, maximum, sycl::maximum<float>());
++        float sum = 0;
++        if (sycl::isfinite(maximum)) {
++#pragma unroll
++            for (int j = 0; j < TILE/W; ++j) sum += sycl::exp((values[j] - maximum) / temperature);
++        }
++        sum = sycl::reduce_over_group(group, sum, sycl::plus<float>());
++        if (lane == 0) {
++            workspace[2*index] = maximum;
++            workspace[2*index+1] = sum;
++        }
++    });
++    g->q.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * W), sycl::range<1>(W)), [=](sycl::nd_item<1> it) {
++        const auto group = it.get_group();
++        const int64_t row = it.get_group(0);
++        const int lane = it.get_local_id(0);
++        const float* parts = workspace + 2 * row * tiles;
++        auto uniform = [&](uint64_t draw) {
++            uint64_t z = seed + 0x9e3779b97f4a7c15ULL * (2 * (uint64_t)(pos0 + row) + draw + 1);
++            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++            return (float)((z ^ (z >> 31)) >> 40) * 0x1p-24f;
++        };
++        float m = -INFINITY;
++        for (int64_t i = lane; i < tiles; i += W) m = sycl::fmax(m, parts[2*i]);
++        m = sycl::reduce_over_group(group, m, sycl::maximum<float>());
++        float mass = 0;
++        for (int64_t i = lane; i < tiles; i += W) mass += parts[2*i+1] * sycl::exp((parts[2*i] - m) / temperature);
++        auto choose_lane = [&](float s, float u) {
++            const float end = sycl::inclusive_scan_over_group(group, s, sycl::plus<float>());
++            const float total = sycl::group_broadcast(group, end, W-1);
++            const float cut = sycl::fmin(u * total, sycl::nextafter(total, 0.0f));
++            const int pick = sycl::reduce_over_group(group, s > 0 && end > cut ? lane : W, sycl::minimum<int>());
++            return sycl::min(pick, W-1);
++        };
++        const int owner = choose_lane(mass, uniform(0));
++        int tile = owner;
++        if (tiles > W && lane == owner) {
++            float cut = uniform(1) * mass;
++            for (int64_t i = owner; i < tiles; i += W) {
++                float p = parts[2*i+1] * sycl::exp((parts[2*i] - m) / temperature);
++                if (p > 0) tile = (int)i;
++                if (cut < p) break;
++                cut -= p;
++            }
++        }
++        tile = sycl::group_broadcast(group, tile, owner);
++        const float tile_max = parts[2*tile];
++        const float* x = logits + row * vocab;
++        constexpr int SPAN = TILE / W;
++        const int64_t start = (int64_t)tile * TILE + lane * SPAN;
++        float weights[SPAN], subtotal = 0;
++#pragma unroll
++        for (int j = 0; j < SPAN; ++j) {
++            weights[j] = start + j < vocab ? sycl::exp((x[start+j] - tile_max) / temperature) : 0.0f;
++            subtotal += weights[j];
++        }
++        const int winner = choose_lane(subtotal, uniform(0x4000000000000000ULL));
++        if (lane == winner) {
++            float cut = uniform(0x6000000000000000ULL) * subtotal;
++            int selected = 0;
++            for (int j = 0; j < SPAN; ++j) {
++                if (weights[j] > 0) selected = j;
++                if (cut < weights[j]) break;
++                cut -= weights[j];
++            }
++            out[row] = (int32_t)(start + selected);
++        }
++    });
++    return 0;
++    NS_CATCH
++}
++
+ // the museglimmer engine's GPU draw (mg.cpp), copied: the 256 largest, temperature, top-p, one uniform a row
+ int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t T, int64_t n, float temp, float top_p, uint64_t seed, int64_t pos0) {
+     NS_TRY
+diff --git a/kernels/llm/inkling2/ink.h b/kernels/llm/inkling2/ink.h
+index 5d5a2ac..d16de0f 100644
+--- a/kernels/llm/inkling2/ink.h
++++ b/kernels/llm/inkling2/ink.h
+@@ -85,6 +85,9 @@ int ns_ink2_softcap(ns_gpu* g, const float* x, float* out, int64_t rows, int64_t
+ /* each row's argmax (the lowest index wins a tie) */
+ int ns_ink2_argmax(ns_gpu* g, const float* x, int32_t* out, int64_t rows, int64_t n);
+ /* each row's draw (temperature, then top-p over its 256 largest), one uniform a row from (seed, pos0 + row) */
++/* workspace holds two floats per row and tile of 1024 vocabulary entries */
++int ns_ink2_sample_full(ns_gpu* g, const float* logits, int32_t* out, float* workspace, int64_t rows, int64_t vocab,
++                        float temperature, uint64_t seed, int64_t pos0);
+ int ns_ink2_sample(ns_gpu* g, const float* x, int32_t* out, int64_t rows, int64_t n, float temperature, float top_p, uint64_t seed, int64_t pos0);
+ 
+ #ifdef __cplusplus
+diff --git a/kernels/llm/inkling2/silo/draft.cpp b/kernels/llm/inkling2/silo/draft.cpp
+index 9c7905a..bdd96e7 100644
+--- a/kernels/llm/inkling2/silo/draft.cpp
++++ b/kernels/llm/inkling2/silo/draft.cpp
+@@ -161,8 +161,8 @@ int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* s
+     NS_CATCH
+ }
+ 
+-int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
+-                         float* prob, int32_t* stop, float pmin) {
++int ns_ink2s_bias_argmax_mapped(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
++                         float* prob, int32_t* stop, float pmin, const int32_t* full_ids) {
+     NS_TRY
+     // the step's logits: softcap(base + BF16(fold_b + bias)), over the first n; the largest (the lowest index of equals)
+     // and its probability (softmax at temperature 1: the online max and sum of exponentials, merged in a fixed order)
+@@ -214,7 +214,7 @@ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const
+                 float st = 0.0f;
+                 for (int s = 0; s < W / SG; ++s)
+                     if (bv[s] > -INFINITY) st += bs[s] * sycl::exp(bv[s] - m2);
+-                out[0] = a2;
++                out[0] = full_ids ? full_ids[a2] : a2;
+                 if (prob) prob[0] = 1.0f / st;
+                 if (stop && 1.0f / st < pmin) stop[0] = 1;
+             }
+@@ -224,6 +224,11 @@ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const
+     NS_CATCH
+ }
+ 
++int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
++                         float* prob, int32_t* stop, float pmin) {
++    return ns_ink2s_bias_argmax_mapped(g, base, bias, fold_b, n, cap, logits, out, prob, stop, pmin, nullptr);
++}
++
+ int ns_ink2s_qk_norm_rope(ns_gpu* g, float* x, int64_t T, int64_t H, const float* w, float eps, float theta, int64_t p0) {
+     NS_TRY
+     constexpr int D = 128;
+diff --git a/kernels/llm/inkling2/silo/mv.cpp b/kernels/llm/inkling2/silo/mv.cpp
+index 9ce2170..603caae 100644
+--- a/kernels/llm/inkling2/silo/mv.cpp
++++ b/kernels/llm/inkling2/silo/mv.cpp
+@@ -67,7 +67,11 @@ inline int dp4a(int a, int b, int c) { return dpct::dp4a(a, b, c); }
+ template <int TY>
+ constexpr int64_t lines(int64_t n) { return TY == 8 ? n / 16 : n / 32; }
+ inline int64_t qrow(int type, int64_t n) { return type == 8 ? n : n / 2; }
+-inline int64_t srow(int type, int64_t n) { return type == 8 ? (n / 32) * 2 : n / 16; }
++inline int64_t srow(int type, int64_t n) {
++    if (type == 12) return (n / 256) * 20;
++    if (type == 6) return (n / 32) * 6;
++    return n / 16;
++}
+ 
+ // line li of a row: its words and factors, against the activations' line (Q8_0: 16 values, 4 words, one scale;
+ // NVFP4: 32 values, 8 words, two scales)
+@@ -82,13 +86,27 @@ struct Line {
+ struct Raw {
+     sycl::int4 v;
+     uint16_t s;
++    float step, minimum;
++    uint32_t negative;
+ };
+ 
+ template <int TY>
+ inline Raw load_raw(const int8_t* q, const uint8_t* s, int64_t li) {
+     Raw r;
+     r.v = *(const sycl::int4*) (q + li * 16);
+-    std::memcpy(&r.s, s + (TY == 8 ? (li >> 1) : li) * 2, 2);
++    if constexpr (TY == 12) {
++        const uint8_t* group = s + (li >> 3) * 20;
++        const uint32_t bases = *reinterpret_cast<const uint32_t*>(group);
++        const uint16_t factors = reinterpret_cast<const uint16_t*>(group + 4)[li & 7];
++        r.step = (float) sycl::bit_cast<half>((uint16_t) bases) * (factors & 0xff);
++        r.minimum = (float) sycl::bit_cast<half>((uint16_t)(bases >> 16)) * (factors >> 8);
++    } else if constexpr (TY == 6) {
++        const uint8_t* pair = s + (li >> 1) * 12;
++        r.negative = reinterpret_cast<const uint32_t*>(pair)[li & 1];
++        r.step = (float) sycl::bit_cast<half>(reinterpret_cast<const uint16_t*>(pair + 8)[li & 1]);
++    } else {
++        std::memcpy(&r.s, s + (TY == 8 ? (li >> 1) : li) * 2, 2);
++    }
+     return r;
+ }
+ 
+@@ -99,6 +117,26 @@ inline Line<TY> decode_line(const Raw& r, const uint32_t* lut) {
+     if constexpr (TY == 8) {
+         l.w[0] = v.x(); l.w[1] = v.y(); l.w[2] = v.z(); l.w[3] = v.w();
+         l.f[0] = (float) sycl::bit_cast<half>(r.s);
++    } else if constexpr (TY == 6) {
++        // Four sign bits become four signed byte prefixes. Nibble 0..15, with -16 for a clear GGUF high bit.
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const uint32_t packed = (uint32_t) v[i];
++            const uint32_t low_signs = ((r.negative >> (4*i)) & 15) * 0x00204081u;
++            const uint32_t high_signs = ((r.negative >> (16+4*i)) & 15) * 0x00204081u;
++            l.w[i] = (packed & 0x0f0f0f0fu) | ((low_signs & 0x01010101u) * 0xf0u);
++            l.w[i+4] = ((packed >> 4) & 0x0f0f0f0fu) | ((high_signs & 0x01010101u) * 0xf0u);
++        }
++        l.f[0] = r.step;
++    } else if constexpr (TY == 12) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const uint32_t packed = (uint32_t) v[i];
++            l.w[i] = packed & 0x0f0f0f0fU;
++            l.w[i + 4] = (packed >> 4) & 0x0f0f0f0fU;
++        }
++        l.f[0] = r.step;
++        l.f[1] = r.minimum;
+     } else {
+         // the group's 16 bytes: sub-block 0's 8 then sub-block 1's; a byte's low nibble value j, its high one j + 8
+         const uint32_t c0 = (uint32_t) v.x(), c1 = (uint32_t) v.y(), c2 = (uint32_t) v.z(), c3 = (uint32_t) v.w();
+@@ -122,6 +160,7 @@ template <int TY>
+ struct XLine {
+     int x[TY == 8 ? 4 : 8];
+     float d;
++    int sum;
+ };
+ 
+ template <int TY>
+@@ -137,6 +176,11 @@ inline XLine<TY> load_x(const int8_t* q, const float* d, int64_t li) {
+         l.x[0] = a.x(); l.x[1] = a.y(); l.x[2] = a.z(); l.x[3] = a.w();
+         l.x[4] = b.x(); l.x[5] = b.y(); l.x[6] = b.z(); l.x[7] = b.w();
+         l.d = d[li];
++        if constexpr (TY == 12) {
++            l.sum = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) l.sum = dp4a(0x01010101, l.x[i], l.sum);
++        }
+     }
+     return l;
+ }
+@@ -150,6 +194,16 @@ inline float ldot(float acc, const Line<TY>& w, const XLine<TY>& x) {
+ #pragma unroll
+         for (int i = 0; i < 4; ++i) s = dp4a(w.w[i], x.x[i], s);
+         return sycl::fma((float) s, w.f[0] * x.d, acc);
++    } else if constexpr (TY == 6) {
++        int dot = 0;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) dot = dp4a(w.w[i], x.x[i], dot);
++        return sycl::fma((float) dot, w.f[0] * x.d, acc);
++    } else if constexpr (TY == 12) {
++        int dot = 0;
++#pragma unroll
++        for (int i = 0; i < 8; ++i) dot = dp4a(w.w[i], x.x[i], dot);
++        return sycl::fma(sycl::fma((float) dot, w.f[0], -(float) x.sum * w.f[1]), x.d, acc);
+     } else {
+         int s0 = 0, s1 = 0;
+ #pragma unroll
+@@ -270,7 +324,7 @@ inline const float* xq_d(const void* xq, int64_t T, int64_t n) { return (const f
+ extern "C" {
+ 
+ int ns_ink2s_supported(int type, int64_t n_in) {
+-    return (type == 8 && n_in % 32 == 0) || (type == 40 && n_in % 64 == 0);
++    return (type == 8 && n_in % 32 == 0) || (type == 6 && n_in % 64 == 0) || (type == 12 && n_in % 256 == 0) || (type == 40 && n_in % 64 == 0);
+ }
+ 
+ size_t ns_ink2s_scales_at(int type, int64_t rows, int64_t n_in) {
+@@ -296,6 +350,44 @@ int ns_ink2s_pack(ns_gpu* g, int type, const void* raw, int64_t rows, int64_t n_
+             s[b * 2 + 1] = p[1];
+             for (int i = 0; i < 32; ++i) q[b * 32 + i] = (int8_t) p[2 + i];
+         });
++    } else if (type == 6) {
++        const int64_t lines = rows * (n_in / 32);
++        g->q.parallel_for(sycl::range<1>((size_t) lines), [=](sycl::id<1> id) {
++            const int64_t line = id[0];
++            const uint8_t* block = src + 22 * line;
++            uint16_t scale;
++            uint32_t high;
++            std::memcpy(&scale, block, 2);
++            std::memcpy(&high, block + 2, 4);
++            high = ~high;
++            uint8_t* pair = s + (line >> 1) * 12;
++            reinterpret_cast<uint32_t*>(pair)[line & 1] = high;
++            reinterpret_cast<uint16_t*>(pair + 8)[line & 1] = scale;
++            std::memcpy(q + 16 * line, block + 6, 16);
++        });
++    } else if (type == 12) {
++        // GGUF Q4_K groups are interleaved in pairs. Each 256-value tile shares its original half scales.
++        const int64_t groups = rows * (n_in / 32);
++        g->q.parallel_for(sycl::range<1>((size_t) groups), [=](sycl::id<1> id) {
++            const int64_t line = id[0];
++            const int group = line % 8;
++            const uint8_t* block = src + (line / 8) * 144;
++            const uint8_t* scales = block + 4;
++            const int sc = group < 4 ? scales[group] & 63
++                : (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4);
++            const int mn = group < 4 ? scales[group + 4] & 63
++                : (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
++            uint8_t* header = s + (line >> 3) * 20;
++            if (group == 0) std::memcpy(header, block, 4);
++            reinterpret_cast<uint16_t*>(header + 4)[group] = (uint16_t)(sc | (mn << 8));
++            const uint8_t* quants = block + 16 + (group / 2) * 32;
++            const int shift = 4 * (group % 2);
++            for (int i = 0; i < 16; ++i) {
++                const unsigned lo = (quants[i] >> shift) & 15;
++                const unsigned hi = (quants[i + 16] >> shift) & 15;
++                q[line * 16 + i] = (int8_t) (lo | (hi << 4));
++            }
++        });
+     } else {
+         // a block of 64: its four scales, its 32 code bytes (two groups of 16)
+         const int64_t nb = rows * (n_in / 64);
+@@ -347,6 +439,32 @@ int ns_ink2s_unpack_f16(ns_gpu* g, int type, const void* w, int64_t rows, int64_
+             for (int i = 0; i < 16; ++i) v[i] = sycl::bit_cast<uint16_t>(half(d * (float) qv[i]));
+             put(dst + r * n_in + c * 16, v);
+         });
++    } else if (type == 6) {
++        g->q.parallel_for(sycl::range<2>((size_t) n, (size_t) per), [=](sycl::id<2> id) {
++            const int64_t row = row0 + id[0], c = id[1], line = c / 2;
++            const auto weight = load_line<6>(q + row * qr, s + row * sr, line, nullptr);
++            uint16_t values[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                const int word = weight.w[(c % 2) * 4 + i / 4];
++                const auto integer = (int8_t) ((uint32_t) word >> (8 * (i % 4)));
++                values[i] = sycl::bit_cast<uint16_t>(half(weight.f[0] * integer));
++            }
++            put(dst + id[0] * n_in + c * 16, values);
++        });
++    } else if (type == 12) {
++        g->q.parallel_for(sycl::range<2>((size_t) n, (size_t) per), [=](sycl::id<2> id) {
++            const int64_t row = row0 + id[0], c = id[1], line = c / 2;
++            const auto raw = load_raw<12>(q + row * qr, s + row * sr, line);
++            const auto codes = *(const sycl::vec<uint8_t, 16>*) (q + row * qr + line * 16);
++            uint16_t values[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i) {
++                const int quant = (codes[i] >> (4 * (c % 2))) & 15;
++                values[i] = sycl::bit_cast<uint16_t>(half(raw.step * quant - raw.minimum));
++            }
++            put(dst + id[0] * n_in + c * 16, values);
++        });
+     } else {
+         g->q.parallel_for(sycl::range<2>((size_t) n, (size_t) per), [=](sycl::id<2> id) {
+             const int64_t r = id[0], c = id[1], row = row0 + r;
+@@ -449,6 +567,7 @@ int ns_ink2s_mv_many(ns_gpu* g, int n, const int* ty, const void* const* w, cons
+     // the jobs of one type a launch (the launches in order); a launch of few rows takes a row a sub-group
+     for (int i = 0; i < n;) {
+         const int t0 = ty[i];
++        if (t0 != 8 && t0 != 40) return ns_fail("dense product expects Q8_0 or NVFP4");
+         int k = i;
+         int64_t total = 0;
+         for (; k < n && ty[k] == t0 && k - i < 8; ++k) total += rows[k];
+@@ -488,7 +607,7 @@ int ns_ink2s_mv(ns_gpu* g, int type, const void* w, const void* xq, float* y, in
+ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* ids, const void* xq, void* act_q, int64_t T,
+                     int64_t K, int64_t n_in, int64_t F, float beta, float lb) {
+     NS_TRY
+-    if (!ns_ink2s_supported(type, n_in) || F % 32) return ns_fail("ns_ink2s_moe_gu: a type or shape it does not take");
++    if (type == 6 || !ns_ink2s_supported(type, n_in) || F % 32) return ns_fail("ns_ink2s_moe_gu: a type or shape it does not take");
+     // a work-group a (pair, 32 act values): 8 sub-groups of 4 values, each 4 gate and 4 up rows
+     constexpr int RV = 4, NS8 = 32 / RV;
+     const int64_t P = T * K, nblk = F / 32, nl = type == 8 ? n_in / 16 : n_in / 32, nbx = n_in / 32;
+@@ -540,6 +659,7 @@ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float*
+         });
+     };
+     if (type == 8) run(std::integral_constant<int, 8>{});
++    else if (type == 12) run(std::integral_constant<int, 12>{});
+     else run(std::integral_constant<int, 40>{});
+     return 0;
+     NS_CATCH
+@@ -548,7 +668,7 @@ int ns_ink2s_moe_gu(ns_gpu* g, int type, const void* w, int64_t E, const float*
+ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* ids, const float* wts, const void* act_q,
+                       float* y, int64_t T, int64_t K, int64_t F, int64_t n_out) {
+     NS_TRY
+-    if (!ns_ink2s_supported(type, F) || K > 16 || K < 1) return ns_fail("ns_ink2s_moe_down: a type or shape it does not take");
++    if (type == 12 || !ns_ink2s_supported(type, F) || K > 16 || K < 1) return ns_fail("ns_ink2s_moe_down: a type or shape it does not take");
+     // a work-group a (row, 4 output rows): a sub-group an expert, its 4 rows; the K sums weighted in order
+     constexpr int RD = 4;
+     const int64_t P = T * K, nrb = (n_out + RD - 1) / RD, nl = type == 8 ? F / 16 : F / 32, nbx = F / 32;
+@@ -599,6 +719,7 @@ int ns_ink2s_moe_down(ns_gpu* g, int type, const void* w, int64_t E, const float
+         });
+     };
+     if (type == 8) run(std::integral_constant<int, 8>{});
++    else if (type == 6) run(std::integral_constant<int, 6>{});
+     else run(std::integral_constant<int, 40>{});
+     return 0;
+     NS_CATCH
+@@ -657,7 +778,7 @@ int ns_ink2s_moe_union(ns_gpu* g, const int32_t* ids, int64_t P, int32_t* uni) {
+ int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const void* xq, void* act_q, int64_t T,
+                           int64_t K, int64_t n_in, int64_t F, float beta, float lb) {
+     NS_TRY
+-    if (!ns_ink2s_supported(type, n_in) || F % 32 || T * K > 256 || T > 16) return ns_fail("ns_ink2s_moe_gu_union: a type or shape it does not take");
++    if (type == 6 || !ns_ink2s_supported(type, n_in) || F % 32 || T * K > 256 || T > 16) return ns_fail("ns_ink2s_moe_gu_union: a type or shape it does not take");
+     // a work-group a (distinct expert, 32 act values): 8 sub-groups of 4 values, each 4 gate and 4 up rows, its lines
+     // read once for every pair of the expert (up to 4 at a time) - each pair's sums as ns_ink2s_moe_gu's
+     constexpr int NS8 = 8, RV = 4, MP = 4;
+@@ -735,6 +856,7 @@ int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const f
+         });
+     };
+     if (type == 8) run(std::integral_constant<int, 8>{});
++    else if (type == 12) run(std::integral_constant<int, 12>{});
+     else run(std::integral_constant<int, 40>{});
+     return 0;
+     NS_CATCH
+@@ -743,7 +865,7 @@ int ns_ink2s_moe_gu_union(ns_gpu* g, int type, const void* w, int64_t E, const f
+ int ns_ink2s_moe_down_union(ns_gpu* g, int type, const void* w, int64_t E, const float* scale, const int32_t* uni, const float* wts, const void* act_q,
+                             float* part, float* y, int64_t T, int64_t K, int64_t F, int64_t n_out) {
+     NS_TRY
+-    if (!ns_ink2s_supported(type, F) || K > 16 || K < 1 || T * K > 256) return ns_fail("ns_ink2s_moe_down_union: a type or shape it does not take");
++    if (type == 12 || !ns_ink2s_supported(type, F) || K > 16 || K < 1 || T * K > 256) return ns_fail("ns_ink2s_moe_down_union: a type or shape it does not take");
+     // a work-group a (distinct expert, 16 output rows): a sub-group 4 rows, its lines read once for every pair of the
+     // expert (up to 4 at a time), each pair's weighted sums into part [P, n_out]; then each row's K sums in order
+     constexpr int RD = 4, NSG = 4, MP = 4;
+@@ -823,6 +945,7 @@ int ns_ink2s_moe_down_union(ns_gpu* g, int type, const void* w, int64_t E, const
+         });
+     };
+     if (type == 8) run(std::integral_constant<int, 8>{});
++    else if (type == 6) run(std::integral_constant<int, 6>{});
+     else run(std::integral_constant<int, 40>{});
+     return 0;
+     NS_CATCH
+diff --git a/kernels/llm/inkling2/silo/silo.h b/kernels/llm/inkling2/silo/silo.h
+index 048c6e7..3825526 100644
+--- a/kernels/llm/inkling2/silo/silo.h
++++ b/kernels/llm/inkling2/silo/silo.h
+@@ -64,6 +64,8 @@ int ns_ink2s_rnn_gates(ns_gpu* g, const float* proj, const float* bias, float* s
+  * the argmax's probability (softmax at temperature 1) into prob[0] (nullable) */
+ int ns_ink2s_bias_argmax(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits, int32_t* out,
+                          float* prob, int32_t* stop, float pmin);
++int ns_ink2s_bias_argmax_mapped(ns_gpu* g, const float* base, const float* bias, const float* fold_b, int64_t n, float cap, float* logits,
++                                int32_t* out, float* prob, int32_t* stop, float pmin, const int32_t* full_ids);
+ /* (stop nullable: stop[0] set when the probability is below pmin; a set stop makes this and ns_ink2s_fold_mv do nothing)
+  * y [rows] = w [rows, n] (BF16, n a multiple of 128) . x [n] */
+ int ns_ink2s_fold_mv(ns_gpu* g, const uint16_t* w, const float* x, float* y, int64_t rows, int64_t n, const int32_t* stop);
+diff --git a/llm/contract/src/sampling.rs b/llm/contract/src/sampling.rs
+index 9899853..70cb894 100644
+--- a/llm/contract/src/sampling.rs
++++ b/llm/contract/src/sampling.rs
+@@ -12,6 +12,12 @@ impl Rng {
+     }
+ }
+ 
++/// Opt-in for a server configured to sample across every token.
++pub fn full_vocab() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("NS_FULL_VOCAB").is_ok_and(|value| value == "1"))
++}
++
+ /// The distribution sampling draws from: softmax(logits / temp) over the 256 likeliest, restricted to the smallest set
+ /// of top tokens holding top_p, normalized. None at temperature 0 (greedy).
+ pub fn dist(logits: &[f32], temp: f32, top_p: f32) -> Option<Vec<(u32, f32)>> {
+@@ -23,7 +29,7 @@ pub fn dist(logits: &[f32], temp: f32, top_p: f32) -> Option<Vec<(u32, f32)>> {
+     // 20.6 tok/s vs greedy's 23.1)
+     let by = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
+     let mut idx: Vec<usize> = (0..logits.len()).collect();
+-    let k = 256.min(idx.len());
++    let k = if full_vocab() { idx.len() } else { 256.min(idx.len()) };
+     if k < idx.len() {
+         idx.select_nth_unstable_by(k - 1, by);
+         idx.truncate(k);
+@@ -31,6 +37,20 @@ pub fn dist(logits: &[f32], temp: f32, top_p: f32) -> Option<Vec<(u32, f32)>> {
+     idx.sort_by(by);
+     let mx = logits[idx[0]];
+     let mut p: Vec<(u32, f32)> = idx.iter().map(|&i| (i as u32, ((logits[i] - mx) / temp).exp())).collect();
++    if full_vocab() {
++        let total: f64 = p.iter().map(|x| f64::from(x.1)).sum();
++        let keep_mass = if top_p < 1.0 {
++            let mut mass = 0.0;
++            let end = p.iter().position(|x| {
++                mass += f64::from(x.1);
++                mass >= f64::from(top_p) * total
++            }).map_or(p.len(), |i| i + 1);
++            p.truncate(end);
++            mass
++        } else { total };
++        for x in &mut p { x.1 = (f64::from(x.1) / keep_mass) as f32; }
++        return Some(p);
++    }
+     let sum: f32 = p.iter().map(|x| x.1).sum();
+     let mut acc = 0.0;
+     let mut keep = p.len();
+@@ -52,6 +72,17 @@ pub fn dist(logits: &[f32], temp: f32, top_p: f32) -> Option<Vec<(u32, f32)>> {
+ 
+ /// Greedy at temperature 0; else a token drawn from `dist`.
+ pub fn sample(logits: &[f32], temp: f32, top_p: f32, rng: &mut Rng) -> u32 {
++    if full_vocab() && temp > 0.0 && top_p >= 1.0 && !logits.is_empty() {
++        let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
++        let weight = |v: f32| f64::from(((v - mx) / temp).exp());
++        let sum: f64 = logits.iter().map(|v| weight(*v)).sum();
++        let mut cut = f64::from(rng.next_f32()) * sum;
++        for (i, &v) in logits.iter().enumerate() {
++            cut -= weight(v);
++            if cut < 0.0 { return i as u32; }
++        }
++        return (logits.len() - 1) as u32;
++    }
+     match dist(logits, temp, top_p) {
+         None => logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32),
+         Some(p) => {
+diff --git a/llm/inkling2/src/engine.rs b/llm/inkling2/src/engine.rs
+index 92ee024..0a4c3a1 100644
+--- a/llm/inkling2/src/engine.rs
++++ b/llm/inkling2/src/engine.rs
+@@ -561,6 +561,27 @@ impl<'g> Inkling2<'g> {
+         let read = |name: &str| -> Result<Mat> { mat(f, &gpu, silo, name, &loaded) };
+         // the controllers in float32 (UD-Q8_K_XL stores them in BF16; the fused decode steps read float32): exact
+         let read32 = |name: &str| -> Result<Mat> {
++            let t = f.tensor(name).ok_or_else(|| e(format!("no {name}")))?;
++            if t.ty == GType::Q8_0 {
++                // The fused controller reads floats. Expand the original GGUF blocks before silo repacking.
++                let raw = f.read(t).map_err(|x| e(x.0))?;
++                let cols = *t.shape.last().ok_or_else(|| e("empty controller shape"))? as usize;
++                let rows = t.shape.iter().product::<u64>() as usize / cols;
++                if cols % 32 != 0 || raw.len() != rows * cols / 32 * 34 {
++                    return Err(e(format!("{name}: invalid Q8_0 controller dimensions")));
++                }
++                let mut wide = Vec::with_capacity(rows * cols * 4);
++                for b in raw.chunks_exact(34) {
++                    let d = nextsycl_gguf::safetensors::f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
++                    for &q in &b[2..] {
++                        wide.extend_from_slice(&(d * f32::from(q as i8)).to_le_bytes());
++                    }
++                }
++                loaded.set(loaded.get() + raw.len() as u64);
++                let buf = DevBuf::new(&gpu, wide.len())?;
++                buf.write(0, &wide)?;
++                return Ok(Mat { buf, ty: GType::F32, rows, cols, packed: false });
++            }
+             let m = read(name)?;
+             match m.ty {
+                 GType::F32 => return Ok(m),
+@@ -1595,9 +1616,16 @@ impl<'g> Inkling2<'g> {
+                 Some(ds) => {
+                     let pos0 = (s.pos - n) as i64;
+                     // SAFETY: each row's draw (row i at its position) into n int32.
+-                    self.op("sample", || unsafe {
+-                        (self.k.sample)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64, ds.temperature, ds.top_p, ds.seed, pos0)
+-                    })?;
++                    if ds.top_p >= 1.0 && nextsycl_llm::sampling::full_vocab() {
++                        let workspace = self.f32(n * v.div_ceil(1024) * 2)?;
++                        self.op("sample full", || unsafe {
++                            (self.k.sample_full)(self.raw(), logits.fp(), best.ptr().cast(), workspace.fp(), n as i64, v as i64, ds.temperature, ds.seed, pos0)
++                        })?;
++                    } else {
++                        self.op("sample", || unsafe {
++                            (self.k.sample)(self.raw(), logits.fp(), best.ptr().cast(), n as i64, v as i64, ds.temperature, ds.top_p, ds.seed, pos0)
++                        })?;
++                    }
+                 }
+             }
+             let mut bb = vec![0u8; n * 4];
+@@ -1882,7 +1910,10 @@ pub fn mat(f: &Gguf, gpu: &Arc<Gpu>, silo: Option<&ffi::Silo>, name: &str, loade
+         1 => (1, t.shape[0] as usize),
+         _ => (t.shape[..t.shape.len() - 1].iter().product::<u64>() as usize, t.shape[t.shape.len() - 1] as usize),
+     };
+-    let ok = matches!(t.ty, GType::F32 | GType::BF16 | GType::Q8_0 | GType::NVFP4);
++    let atomic_expert = ((t.ty == GType::Q4K && name.ends_with(".ffn_gate_up_exps.weight"))
++        || (t.ty == GType::Q5_0 && name.ends_with(".ffn_down_exps.weight")))
++        && silo.is_some_and(|s| unsafe { (s.supported)(t.ty.code() as c_int, cols as i64) } != 0);
++    let ok = matches!(t.ty, GType::F32 | GType::BF16 | GType::Q8_0 | GType::NVFP4) || atomic_expert;
+     if !ok {
+         return Err(e(format!("{name}: {} - this engine reads F32, BF16, Q8_0 and NVFP4", t.ty.name())));
+     }
+diff --git a/llm/inkling2/src/engine/dspark.rs b/llm/inkling2/src/engine/dspark.rs
+index 4901d33..ed2c6e0 100644
+--- a/llm/inkling2/src/engine/dspark.rs
++++ b/llm/inkling2/src/engine/dspark.rs
+@@ -48,6 +48,8 @@ pub struct DSpark {
+     joint: Mat,
+     joint_b: DevBuf,
+     /// head x dspark_hidden_out [vocab_pad, rank] BF16, head x its bias [vocab_pad]
++    head: Option<Mat>,
++    full_ids: Option<DevBuf>,
+     fold: Mat,
+     fold_b: DevBuf,
+     /// the target's application indices whose input streams are features 0..3
+@@ -211,6 +213,31 @@ pub fn load(d: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, k: &ffi::Api, s: &'static ff
+     let wt_dev = DevBuf::new(gpu, wt.len() * 2)?;
+     // SAFETY: (rank + 1) x c floats -> half.
+     unsafe { ffi::check((k.to_f16)(gpu.raw(), wt32.fp(), wt_dev.ptr().cast(), wt.len() as i64), "fold half")? };
++    // Reduced draft rows carry their original vocabulary IDs. Only the proposal head uses them.
++    let (head, full_ids) = match (d.tensor("dspark_out_sub.weight"), d.tensor("dspark_out_sub_ids.weight")) {
++        (Some(_), Some(ids)) => {
++            let head = read("dspark_out_sub.weight")?;
++            if head.cols != g.n_embd || head.rows == 0 || head.rows > g.vocab || ids.ty != GType::F32 || ids.shape != [head.rows as u64] {
++                return Err(e("invalid reduced draft head dimensions or ID type"));
++            }
++            let raw = d.read(ids).map_err(|err| e(err.0))?;
++            let mut seen = vec![false; g.vocab];
++            let mut mapped = Vec::with_capacity(raw.len());
++            for b in raw.chunks_exact(4) {
++                let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
++                let id = value as usize;
++                if id >= g.vocab || value != id as f32 || seen[id] { return Err(e("invalid or repeated reduced draft token ID")); }
++                seen[id] = true;
++                mapped.extend_from_slice(&(id as i32).to_le_bytes());
++            }
++            let full_ids = DevBuf::new(gpu, mapped.len())?;
++            full_ids.write(0, &mapped)?;
++            (Some(head), Some(full_ids))
++        }
++        (None, None) => (None, None),
++        _ => return Err(e("incomplete reduced draft head")),
++    };
++    let output = head.as_ref().unwrap_or(output);
+     let vp = output.rows;
+     let fold_buf = DevBuf::new(gpu, vp * rank * 2)?;
+     let fold_b = DevBuf::new(gpu, vp * 4)?;
+@@ -257,7 +284,7 @@ pub fn load(d: &Gguf, g: &Geometry, gpu: &Arc<Gpu>, k: &ffi::Api, s: &'static ff
+     arena.rewind(mark);
+     let fold = Mat { buf: fold_buf, ty: GType::BF16, rows: vp, cols: rank, packed: false };
+     let bytes = loaded.get() + w1raw.len() as u64 + (vp * rank * 2 + vp * 4) as u64;
+-    Ok(DSpark { layers, alpha, norm: read("output_norm.weight")?.buf, frnn_norm: read("dspark_norm.weight")?.buf, mask_rows, w1, joint, joint_b, fold, fold_b,
++    Ok(DSpark { layers, alpha, norm: read("output_norm.weight")?.buf, frnn_norm: read("dspark_norm.weight")?.buf, mask_rows, w1, joint, joint_b, head, full_ids, fold, fold_b,
+                 taps: taps[..FEATS - 1].to_vec(), rank, heads, heads_kv, ff, theta, eps, block, bytes })
+ }
+ 
+@@ -465,8 +492,10 @@ impl Inkling2<'_> {
+         // the block's rows after the first: the drafter's norm, the target's head (base logits)
+         let after = x.view(c * 4, nd * c * 4)?;
+         let (hid, hq) = self.rms_q(&after, &d.norm, nd)?;
+-        let vp = self.output.rows;
+-        let base = self.mmq(&self.output, &hid, hq.as_ref(), nd)?;
++        let proposal_head = d.head.as_ref().unwrap_or(&self.output);
++        let vp = proposal_head.rows;
++        let vocab = if d.full_ids.is_some() { vp } else { g.vocab };
++        let base = self.mmq(proposal_head, &hid, hq.as_ref(), nd)?;
+         // the Markov head, a position at a time: the token before it (the tail first), the hidden row, f_rnn
+         let toks = self.ab((nd + 1) * 4)?;
+         toks.write_async(0, &tail.to_le_bytes())?;
+@@ -501,8 +530,9 @@ impl Inkling2<'_> {
+             // SAFETY: as above.
+             unsafe {
+                 let pj = probs.view(j * 4, 4)?;
+-                self.op("draft pick", || (dk.bias_argmax)(self.raw(), bj.fp(), bias.fp(), d.fold_b.fp(), g.vocab as i64, g.softcap, std::ptr::null_mut(),
+-                                                          next.ptr().cast(), pj.fp(), stop.ptr().cast(), pmin))?
++                self.op("draft pick", || (dk.bias_argmax)(self.raw(), bj.fp(), bias.fp(), d.fold_b.fp(), vocab as i64, g.softcap, std::ptr::null_mut(),
++                                                          next.ptr().cast(), pj.fp(), stop.ptr().cast(), pmin,
++                                                          d.full_ids.as_ref().map_or(std::ptr::null(), |b| b.ptr().cast())))?
+             };
+         }
+         let mut b = vec![0u8; (nd + 1) * 4];
+diff --git a/llm/inkling2/src/ffi.rs b/llm/inkling2/src/ffi.rs
+index 0782d0e..3bbca69 100644
+--- a/llm/inkling2/src/ffi.rs
++++ b/llm/inkling2/src/ffi.rs
+@@ -47,6 +47,7 @@ pub struct Api {
+     pub add: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, i64) -> c_int,
+     pub softcap: unsafe extern "C" fn(G, *const f32, *mut f32, i64, i64, i64, f32) -> c_int,
+     pub argmax: unsafe extern "C" fn(G, *const f32, *mut i32, i64, i64) -> c_int,
++    pub sample_full: unsafe extern "C" fn(G, *const f32, *mut i32, *mut f32, i64, i64, f32, u64, i64) -> c_int,
+     /// (logits, out, T, n, temperature, top_p, seed, pos0)
+     pub sample: unsafe extern "C" fn(G, *const f32, *mut i32, i64, i64, f32, f32, u64, i64) -> c_int,
+ }
+@@ -102,6 +103,7 @@ pub fn api() -> nextsycl_core::Result<&'static Api> {
+             softcap: sym!("ns_ink2_softcap"),
+             argmax: sym!("ns_ink2_argmax"),
+             sample: sym!("ns_ink2_sample"),
++            sample_full: sym!("ns_ink2_sample_full"),
+         })
+     })
+     .as_ref()
+@@ -234,7 +236,7 @@ pub struct Draft {
+     /// (proj, bias, state, latent, rank)
+     pub rnn_gates: unsafe extern "C" fn(G, *const f32, *const f32, *mut f32, *mut f32, i64) -> c_int,
+     /// (base, bias, fold_b, n, cap, logits, out, prob, stop, pmin)
+-    pub bias_argmax: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, f32, *mut f32, *mut i32, *mut f32, *mut i32, f32) -> c_int,
++    pub bias_argmax: unsafe extern "C" fn(G, *const f32, *const f32, *const f32, i64, f32, *mut f32, *mut i32, *mut f32, *mut i32, f32, *const i32) -> c_int,
+     /// (w, x, y, rows, n, stop)
+     pub fold_mv: unsafe extern "C" fn(G, *const u16, *const f32, *mut f32, i64, i64, *const i32) -> c_int,
+     /// (x, T, H, w, eps, theta, p0)
+@@ -320,7 +322,7 @@ fn bind(lib: &nextsycl_core::SiloLib) -> std::result::Result<Silo, String> {
+                 to_bf16: sym!("ns_ink2s_to_bf16"),
+                 rnn_inputs: sym!("ns_ink2s_rnn_inputs"),
+                 rnn_gates: sym!("ns_ink2s_rnn_gates"),
+-                bias_argmax: sym!("ns_ink2s_bias_argmax"),
++                bias_argmax: sym!("ns_ink2s_bias_argmax_mapped"),
+                 fold_mv: sym!("ns_ink2s_fold_mv"),
+                 qk_norm_rope: sym!("ns_ink2s_qk_norm_rope"),
+                 attn_part_block: sym!("ns_ink2s_attn_part_block"),

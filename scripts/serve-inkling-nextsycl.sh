@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Single-stream B70 decode of the AtomicChat Inkling checkpoint.
+set -euo pipefail
+if [[ ${1:-} == --help ]]; then
+    echo 'Set RUNTIME, MODELS and API_KEY_FILE, then run serve-inkling-nextsycl.sh.'
+    echo 'RUNTIME is a directory containing nextsycl, libnextsycl-llm.so and silo/libnextsycl-inkling2.so.'
+    echo 'INKLING_NATIVE_PORT defaults to 18081. CTX defaults to 131072. SYCL_IMAGE selects the oneAPI runtime image.'
+    exit 0
+fi
+[[ $# == 0 ]] || { echo 'See --help for usage.' >&2; exit 2; }
+runtime=$(realpath -e "${RUNTIME:?set RUNTIME to the native runtime directory}")
+models=$(realpath -e "${MODELS:?set MODELS to the directory containing the GGUF files}")
+key_file=$(realpath -e "${API_KEY_FILE:?set API_KEY_FILE to a bearer key file}")
+target="$models/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf"
+draft="$models/dspark-Inkling-2-Mini-Q8_0-sub32k-unc.gguf"
+port=${INKLING_NATIVE_PORT:-18081}
+context=${CTX:-131072}
+for file in "$runtime/nextsycl" "$runtime/libnextsycl-llm.so" "$runtime/silo/libnextsycl-inkling2.so" "$target" "$draft" "$key_file"; do
+    [[ -s "$file" ]] || { echo "Missing file: $file" >&2; exit 1; }
+done
+exec docker run --rm --init --name "inkling-unc-native-$port" --stop-timeout 10 \
+    --device /dev/dri/renderD128 -p "127.0.0.1:$port:18081" \
+    --mount "type=bind,src=$runtime,dst=/runtime,readonly" \
+    --mount "type=bind,src=$target,dst=/models/inkling.gguf,readonly" \
+    --mount "type=bind,src=$draft,dst=/models/dspark.gguf,readonly" \
+    --mount "type=bind,src=$key_file,dst=/run/inference.key,readonly" \
+    -e ONEAPI_DEVICE_SELECTOR=level_zero:0 -e NS_IN_IMAGE=1 -e NS_LIB_FROM_DISK=1 \
+    -e NEXTSYCL_LIB=/runtime/libnextsycl-llm.so -e NS_SILO_DIR=/runtime/silo -e NS_SILO_REQUIRED=1 \
+    -e NS_API_KEY_FILE=/run/inference.key -e NS_FULL_VOCAB=1 \
+    -e NS_INK2_DRAFT=/models/dspark.gguf -e NS_INK2_DRAFTS=6 -e NS_INK2_DRAFT_PMIN=0.65 \
+    --entrypoint bash "${SYCL_IMAGE:-strata-sycl-dev}" -lc '
+        source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1
+        exec /runtime/nextsycl serve /models/inkling.gguf --gpu 0 --name inkling-2-mini \
+            --ctx "$1" --parallel 1 --host 0.0.0.0 --port 18081 --effort low
+    ' -- "$context"
