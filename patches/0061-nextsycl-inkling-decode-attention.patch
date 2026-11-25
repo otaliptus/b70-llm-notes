@@ -1,0 +1,423 @@
+diff --git a/kernels/llm/inkling2/silo/attn.cpp b/kernels/llm/inkling2/silo/attn.cpp
+index e6cd0908c05e86b6e22049e898a36cf030c86a02..0e8018aea780bdaeaf1809484efbf13baa84a92f 100644
+--- a/kernels/llm/inkling2/silo/attn.cpp
++++ b/kernels/llm/inkling2/silo/attn.cpp
+@@ -8,6 +8,7 @@
+ #include "silo.h"
+ #include "b70.hpp"
+ #include "attn_long.hpp"
++#include <cstdlib>
+ #include <type_traits>
+ 
+ #include <sycl/sycl.hpp>
+@@ -22,6 +23,139 @@ void range(int64_t T, int64_t p0, int64_t win, int64_t& s0, int64_t& ns) {
+     s0 = lo / KB;
+     ns = (hi - 1) / KB - s0 + 1;
+ }
++// The split kernel for T <= 8 rows: a work-group a (key head, split) for all rows, the split's keys and values (the union
++// of the rows' ranges) in local memory once. Each (row, query head) takes P sub-groups: sub-group u of them computes the
++// logits of keys lane + 16 v for v in [u 4/P, (u+1) 4/P) and the value sums of dims [u D/P, (u+1) D/P). Every value is
++// the one the one-row kernel below computes: the same lane a key (counted from the row's own first key) and so the same
++// dimension rotation, the same fma chains in the same order, the maximum over all the split's keys (exact in any order),
++// the probabilities' sum as each lane's 4 in key-slice order and then the same sub-group sum, each dim's value sum over
++// the keys in order. Only the tile is shared and the work spread (ideas: steveseguin b70-optimization-lab inkling2, check
++// steps reading each key once for all their tokens; small kernels with the reads issued first).
++template <int P>
++void attn_rows(sycl::queue& queue, const float* qp, const half* kc, const half* vc, const float* r, const float* relb, int64_t E, int64_t R,
++               float* part, int64_t T, int64_t Hq, int64_t Hkv, int64_t cap, int64_t p0, int64_t win, float scale, bool block, int64_t s0,
++               int64_t ns, int64_t prefix) {
++    constexpr int PK = KB / SG, KU = PK / P, DU = D / P, DLU = DU / SG;
++    const int NRH = (int) T * G, NSG = NRH * P;
++    queue.submit([&](sycl::handler& h) {
++        sycl::local_accessor<half, 1> ks(sycl::range<1>((size_t) KB * D), h);
++        sycl::local_accessor<half, 1> vs(sycl::range<1>((size_t) KB * D), h);
++        // each (row, head): its query (scaled), bias query, the split's logits then probabilities, the parts' maxima
++        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) NRH * (D + SG + KB + P)), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (Hkv * (ns - prefix)) * NSG * SG), sycl::range<1>((size_t) NSG * SG)),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++            auto sg = it.get_sub_group();
++            const int lane = (int) sg.get_local_linear_id(), sgw = (int) sg.get_group_linear_id();
++            const int u = sgw % P, rh = sgw / P;
++            const int64_t gi = it.get_group(0);
++            const int64_t sp = prefix + gi % (ns - prefix), hk = gi / (ns - prefix);
++            const int64_t rr = rh / G, hq = hk * G + rh % G;
++            const int64_t kb0 = (s0 + sp) * KB, kb1 = kb0 + KB;
++            const int64_t tfirst = win > 0 ? sycl::max<int64_t>(0, p0 + 1 - win) : 0, tend = p0 + T;
++            const int64_t tlo = sycl::max<int64_t>(tfirst, kb0), thi = sycl::min<int64_t>(tend, kb1);
++            const int nt = thi > tlo ? (int) (thi - tlo) : 0;
++            const int64_t pos = p0 + rr, wpos = block ? p0 : pos;
++            const int64_t first = win > 0 ? sycl::max<int64_t>(0, wpos + 1 - win) : 0, end = block ? p0 + T : pos + 1;
++            const int64_t lo = sycl::max<int64_t>(first, kb0), hi = sycl::min<int64_t>(end, kb1);
++            const int64_t nk = hi > lo ? hi - lo : 0;
++            const int64_t off = nk > 0 ? lo - tlo : 0;
++            float* qx = qs.get_multi_ptr<sycl::access::decorated::no>().get() + rh * (D + SG + KB + P);
++            float* rx = qx + D;
++            float* px = rx + SG;
++            float* mp = px + KB;
++            if (u == 0) {
++#pragma unroll
++                for (int i = 0; i < DL; ++i) qx[lane * DL + i] = qp[(rr * Hq + hq) * D + lane * DL + i] * scale;
++                rx[lane] = lane < R && r ? r[(rr * Hq + hq) * R + lane] : 0.0f;
++            }
++            {
++                const int64_t s0k = tlo % cap;
++                constexpr int FB = 4;
++                for (int j0 = sgw; j0 < nt; j0 += NSG * FB) {
++                    sycl::uint4 kr[FB], vr[FB];
++#pragma unroll
++                    for (int b = 0; b < FB; ++b) {
++                        int64_t slot = s0k + sycl::min(j0 + b * NSG, nt - 1);
++                        if (slot >= cap) slot -= cap;
++                        kr[b] = ((const sycl::uint4*) (kc + (hk * cap + slot) * D))[lane];
++                        vr[b] = ((const sycl::uint4*) (vc + (hk * cap + slot) * D))[lane];
++                    }
++#pragma unroll
++                    for (int b = 0; b < FB; ++b) {
++                        const int jj = j0 + b * NSG;
++                        if (jj < nt) {
++                            ((sycl::uint4*) (ks.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = kr[b];
++                            ((sycl::uint4*) (vs.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = vr[b];
++                        }
++                    }
++                }
++            }
++            sycl::group_barrier(it.get_group());
++            const half* kp = ks.get_multi_ptr<sycl::access::decorated::no>().get() + off * D;
++            const half* vp = vs.get_multi_ptr<sycl::access::decorated::no>().get() + off * D;
++            // this sub-group's key slices: the logits (as the one-row kernel), kept in px, and their maximum
++            float mloc = -INFINITY;
++#pragma unroll
++            for (int kv = 0; kv < KU; ++kv) {
++                const int jj = lane + (u * KU + kv) * SG;
++                float v = -INFINITY;
++                if (jj < nk) {
++                    float dot = 0.0f;
++#pragma unroll
++                    for (int c = 0; c < SG; ++c) {
++                        const int ci = (c + lane) & (SG - 1);
++                        const sycl::vec<half, 8> kv8 = *(const sycl::vec<half, 8>*) (kp + jj * D + ci * DL);
++#pragma unroll
++                        for (int i = 0; i < DL; ++i) dot = sycl::fma(qx[ci * DL + i], (float) kv8[i], dot);
++                    }
++                    const int64_t d = pos - (lo + jj);
++                    if (d >= 0 && d < E) {
++                        for (int i = 0; i < R; ++i) dot = sycl::fma(rx[i], relb[d * R + i], dot);
++                    }
++                    v = dot;
++                }
++                px[jj] = v;
++                mloc = sycl::fmax(mloc, v);
++            }
++            mloc = sycl::reduce_over_group(sg, mloc, sycl::maximum<float>());
++            if (lane == 0) mp[u] = mloc;
++            sycl::group_barrier(it.get_group());
++            float m = mp[0];
++#pragma unroll
++            for (int k = 1; k < P; ++k) m = sycl::fmax(m, mp[k]);
++#pragma unroll
++            for (int kv = 0; kv < KU; ++kv) {
++                const int jj = lane + (u * KU + kv) * SG;
++                px[jj] = nk > 0 && jj < nk ? sycl::exp(px[jj] - m) : 0.0f;
++            }
++            sycl::group_barrier(it.get_group());
++            // the sum as the one-row kernel adds it: each lane its 4 key slices in order from 0, then the sub-group sum
++            float s = 0.0f;
++            if (u == 0) {
++#pragma unroll
++                for (int k = 0; k < PK; ++k) s += px[lane + k * SG];
++                s = sycl::reduce_over_group(sg, s, sycl::plus<float>());
++            }
++            float acc[DLU];
++#pragma unroll
++            for (int i = 0; i < DLU; ++i) acc[i] = 0.0f;
++            const int dbase = u * DU + lane * DLU;
++            for (int64_t jj = 0; jj < nk; ++jj) {
++                const float p = px[jj];
++                const half* vr = vp + jj * D + dbase;
++#pragma unroll
++                for (int i = 0; i < DLU; ++i) acc[i] = sycl::fma(p, (float) vr[i], acc[i]);
++            }
++            float* pp = part + ((rr * Hq + hq) * ns + sp) * (D + 2);
++#pragma unroll
++            for (int i = 0; i < DLU; ++i) pp[dbase + i] = acc[i];
++            if (u == 0 && lane == 0) {
++                pp[D] = m;
++                pp[D + 1] = s;
++            }
++        });
++    });
++}
+ }  // namespace
+ 
+ extern "C" {
+@@ -55,6 +189,16 @@ static int attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* vc
+     if (prefix == ns) return 0;
+     const half* kc = (const half*) kcv;
+     const half* vc = (const half*) vcv;
++    // NS_INK2_ATTN_ROWS=0: a work-group a row as before; 1: the shared tile, a sub-group a (row, head); 2 (default): the
++    // shared tile with each (row, head) spread over 4 sub-groups up to 2 rows, 2 sub-groups up to 4 rows
++    static const int rows_mode = [] { const char* v = std::getenv("NS_INK2_ATTN_ROWS"); return v ? std::atoi(v) : 2; }();
++    if (T <= 8 && rows_mode > 0 && (T > 1 || rows_mode > 1)) {
++        const int P = rows_mode < 2 ? 1 : T <= 2 ? 4 : T <= 4 ? 2 : 1;
++        if (P == 4) attn_rows<4>(g->q, qp, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale, block, s0, ns, prefix);
++        else if (P == 2) attn_rows<2>(g->q, qp, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale, block, s0, ns, prefix);
++        else attn_rows<1>(g->q, qp, kc, vc, r, relb, E, R, part, T, Hq, Hkv, cap, p0, win, scale, block, s0, ns, prefix);
++        return 0;
++    }
+     constexpr int WG = G * SG;
+     g->q.submit([&](sycl::handler& h) {
+         sycl::local_accessor<half, 1> ks(sycl::range<1>((size_t) KB * D), h);
+@@ -84,13 +228,27 @@ static int attn_part(ns_gpu* g, const float* qp, const void* kcv, const void* vc
+             {
+                 const int64_t s0k = lo % cap;
+                 const int nki = (int) nk;
+-                for (int jj = sgi; jj < nki; jj += G) {
+-                    int64_t slot = s0k + jj;
+-                    if (slot >= cap) slot -= cap;
+-                    const sycl::uint4* ksrc = (const sycl::uint4*) (kc + (hk * cap + slot) * D) + lane;
+-                    const sycl::uint4* vsrc = (const sycl::uint4*) (vc + (hk * cap + slot) * D) + lane;
+-                    ((sycl::uint4*) (ks.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = *ksrc;
+-                    ((sycl::uint4*) (vs.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = *vsrc;
++                // reads first: FB keys' and values' loads in flight together, then their stores (clamped indexes past
++                // the end, stores only below nk); the same tile in local memory as one key at a time (idea:
++                // steveseguin b70-optimization-lab inkling2, small kernels with the reads issued first)
++                constexpr int FB = 6;
++                for (int j0 = sgi; j0 < nki; j0 += G * FB) {
++                    sycl::uint4 kr[FB], vr[FB];
++#pragma unroll
++                    for (int u = 0; u < FB; ++u) {
++                        int64_t slot = s0k + sycl::min(j0 + u * G, nki - 1);
++                        if (slot >= cap) slot -= cap;
++                        kr[u] = ((const sycl::uint4*) (kc + (hk * cap + slot) * D))[lane];
++                        vr[u] = ((const sycl::uint4*) (vc + (hk * cap + slot) * D))[lane];
++                    }
++#pragma unroll
++                    for (int u = 0; u < FB; ++u) {
++                        const int jj = j0 + u * G;
++                        if (jj < nki) {
++                            ((sycl::uint4*) (ks.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = kr[u];
++                            ((sycl::uint4*) (vs.get_multi_ptr<sycl::access::decorated::no>().get() + jj * D))[lane] = vr[u];
++                        }
++                    }
+                 }
+             }
+             sycl::group_barrier(it.get_group());
+diff --git a/kernels/llm/inkling2/silo/attn_long.hpp b/kernels/llm/inkling2/silo/attn_long.hpp
+index 99b7684a1c7d3576b63c81d09676b2bb0c783583..e8afefe47dbf80364dcccc089e5cde83e25c5a2a 100644
+--- a/kernels/llm/inkling2/silo/attn_long.hpp
++++ b/kernels/llm/inkling2/silo/attn_long.hpp
+@@ -71,9 +71,17 @@ inline void value(sycl::queue& queue, const half* values, float* part, int T, in
+                 qr = sg.get_group_linear_id();
+             int head = (qr / G) * Hq + hk * G + qr % G;
+             auto* vp = cache.get_multi_ptr<sycl::access::decorated::no>().get();
+-            for (int i = qr; i < KB; i += nq)
+-                reinterpret_cast<sycl::uint4*>(vp + i * D)[lane] =
+-                    reinterpret_cast<const sycl::uint4*>(values + (size_t(hk) * cap + sp * KB + i) * D)[lane];
++            // reads first: VB values' loads in flight together, then their stores (the same tile)
++            constexpr int VB = 8;
++            for (int i0 = qr; i0 < KB; i0 += nq * VB) {
++                sycl::uint4 vr[VB];
++#pragma unroll
++                for (int u = 0; u < VB; ++u)
++                    vr[u] = reinterpret_cast<const sycl::uint4*>(values + (size_t(hk) * cap + sp * KB + sycl::min(i0 + u * nq, KB - 1)) * D)[lane];
++#pragma unroll
++                for (int u = 0; u < VB; ++u)
++                    if (i0 + u * nq < KB) reinterpret_cast<sycl::uint4*>(vp + (i0 + u * nq) * D)[lane] = vr[u];
++            }
+             float* pp = part + (size_t(head) * ns + sp) * (D + 2);
+             auto* p = probs.get_multi_ptr<sycl::access::decorated::no>().get() + qr * KB;
+             float lg[4], m = -INFINITY;
+diff --git a/kernels/llm/inkling2/silo/dec.cpp b/kernels/llm/inkling2/silo/dec.cpp
+index 0243090c59a982906ff88e027b582510833da9ae..c40ff411b6b84ebe23fb92d28ebf89c72149d1e4 100644
+--- a/kernels/llm/inkling2/silo/dec.cpp
++++ b/kernels/llm/inkling2/silo/dec.cpp
+@@ -36,6 +36,12 @@ inline float* xqd(void* xq, int64_t T, int64_t n) { return (float*) ((uint8_t*)
+ 
+ constexpr int MIXW = 1024, MAXS = 8, MAXQ = 4;
+ 
++// a pointer read from a job table cast to global memory: loads through generic pointers are slow (idea and measurement:
++// steveseguin b70-optimization-lab inkling2, gemv.hpp gptr); the same loads and arithmetic
++template <class T> inline T* gptr(T* p) {
++    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p).get();
++}
++
+ // a work-group's sums of NV values (each thread's partials): sub-group sums, then a thread a value over the sub-groups
+ template <int NV>
+ inline void group_sums(sycl::nd_item<1> it, const float* part, float* slm, float* out) {
+@@ -470,13 +476,37 @@ int ns_ink2s_merge_gate_xq(ns_gpu* g, const float* part, const float* sink, cons
+             const int dd = (int) it.get_local_id(0);
+             const float* pp = part + rh * ns * (D + 2);
+             const float sk = sink ? sink[rh] : -INFINITY;
++            // Reads first: each round loads MB splits' values (indexes past the end clamped to the last split), then
++            // applies the same operations in the same order as one split at a time, so the bits are unchanged; the
++            // loads are in flight together instead of one round trip a split (idea: steveseguin b70-optimization-lab
++            // inkling2, "Writing step, small kernels": reads first, unrolled, clamped indexes past the end).
++            constexpr int MB = 8;
+             float M = sk;
+-            for (int64_t i = 0; i < ns; ++i) M = sycl::fmax(M, pp[i * (D + 2) + D]);
++            for (int64_t i0 = 0; i0 < ns; i0 += MB) {
++                float mv[MB];
++#pragma unroll
++                for (int u = 0; u < MB; ++u) mv[u] = pp[sycl::min<int64_t>(i0 + u, ns - 1) * (D + 2) + D];
++#pragma unroll
++                for (int u = 0; u < MB; ++u)
++                    if (i0 + u < ns) M = sycl::fmax(M, mv[u]);
++            }
+             float S = sink ? sycl::exp(sk - M) : 0.0f, A = 0.0f;
+-            for (int64_t i = 0; i < ns; ++i) {
+-                const float c = sycl::exp(pp[i * (D + 2) + D] - M);
+-                S += pp[i * (D + 2) + D + 1] * c;
+-                A += pp[i * (D + 2) + dd] * c;
++            for (int64_t i0 = 0; i0 < ns; i0 += MB) {
++                float mv[MB], sv[MB], av[MB];
++#pragma unroll
++                for (int u = 0; u < MB; ++u) {
++                    const float* pi = pp + sycl::min<int64_t>(i0 + u, ns - 1) * (D + 2);
++                    mv[u] = pi[D];
++                    sv[u] = pi[D + 1];
++                    av[u] = pi[dd];
++                }
++#pragma unroll
++                for (int u = 0; u < MB; ++u)
++                    if (i0 + u < ns) {
++                        const float c = sycl::exp(mv[u] - M);
++                        S += sv[u] * c;
++                        A += av[u] * c;
++                    }
+             }
+             const int64_t at = t * n + hq * D + dd;
+             const float y = gate ? A / S * (1.0f / (1.0f + sycl::exp(-gate[at]))) : A / S;
+@@ -567,10 +597,10 @@ int ns_ink2s_ctrl_down_many(ns_gpu* g, int n, const float* const* cur, const flo
+             gi /= blocks;
+             const int64_t t = gi % T;
+             const int k = (int) (gi / T);
+-            const float* down = jb.down[k];
++            const float* down = gptr(jb.down[k]);
+             const int tid = (int) it.get_local_id(0);
+-            const sycl::float4* a = (const sycl::float4*) (jb.cur[k] + t * C);
+-            const sycl::float4* b = (const sycl::float4*) (jb.msg[k] + t * C);
++            const sycl::float4* a = (const sycl::float4*) (gptr(jb.cur[k]) + t * C);
++            const sycl::float4* b = (const sycl::float4*) (gptr(jb.msg[k]) + t * C);
+             float* zp = z.get_multi_ptr<sycl::access::decorated::no>().get();
+             float* s = sl.get_multi_ptr<sycl::access::decorated::no>().get();
+             const int64_t c4 = C / 4;
+@@ -608,7 +638,7 @@ int ns_ink2s_ctrl_down_many(ns_gpu* g, int n, const float* const* cur, const flo
+             if (tid < RPW && r0 + tid < rank) {
+                 float v = 0.0f;
+                 for (int i = 0; i < W / SG; ++i) v += s[i * RPW + tid];
+-                jb.uo[k][t * rank + r0 + tid] = v;
++                gptr(jb.uo[k])[t * rank + r0 + tid] = v;
+             }
+         });
+     });
+@@ -646,9 +676,9 @@ int ns_ink2s_ctrl_apply_many(ns_gpu* g, int n, const float* const* cur, const fl
+         gi /= blocks;
+         const int64_t t = gi % T;
+         const int k = (int) (gi / T);
+-        const float* u = jb.u[k];
+-        const float* gain = jb.gain[k];
+-        const float* forget = jb.forget[k];
++        const float* u = gptr(jb.u[k]);
++        const float* gain = gptr(jb.gain[k]);
++        const float* forget = gptr(jb.forget[k]);
+         float uv[4];
+         for (int i = 0; i < 4; ++i) uv[i] = lane + i * SG < rank ? u[t * rank + lane + i * SG] : 0.0f;
+         for (int kk = 0; kk < 4; ++kk) {
+@@ -665,8 +695,8 @@ int ns_ink2s_ctrl_apply_many(ns_gpu* g, int n, const float* const* cur, const fl
+             gs = sycl::reduce_over_group(sg, gs, sycl::plus<float>());
+             fs = sycl::reduce_over_group(sg, fs, sycl::plus<float>());
+             if (lane == 0) {
+-                const float x = jb.cur[k][t * C + c];
+-                jb.out[k][t * C + c] = (x - sycl::tanh(fs) * x) + sycl::tanh(gs) * jb.msg[k][t * C + c];
++                const float x = gptr(jb.cur[k])[t * C + c];
++                gptr(jb.out[k])[t * C + c] = (x - sycl::tanh(fs) * x) + sycl::tanh(gs) * gptr(jb.msg[k])[t * C + c];
+             }
+         }
+     });
+diff --git a/kernels/llm/inkling2/silo/merge_long.hpp b/kernels/llm/inkling2/silo/merge_long.hpp
+index 9d778732e4ad1b49dc62e732d186ece6def96854..40bb9b5b18b51f95496fe9f82c5b540898727b0f 100644
+--- a/kernels/llm/inkling2/silo/merge_long.hpp
++++ b/kernels/llm/inkling2/silo/merge_long.hpp
+@@ -34,8 +34,19 @@ extern "C" int ns_ink2s_merge_exact(ns_gpu* g, const float* part, const float* s
+             sycl::group_barrier(group);
+             if (!tid) {
+                 float z = sink ? sycl::exp(sk - m) : 0.f;
+-                for (int i = 0; i < ns; ++i)
+-                    z += mass[i] * c[i];
++                // reads first: 8 splits' values from local memory, then the same products in the same order
++                for (int i0 = 0; i0 < ns; i0 += 8) {
++                    float ma[8], ca[8];
++#pragma unroll
++                    for (int u = 0; u < 8; ++u) {
++                        const int i = sycl::min(i0 + u, ns - 1);
++                        ma[u] = mass[i];
++                        ca[u] = c[i];
++                    }
++#pragma unroll
++                    for (int u = 0; u < 8; ++u)
++                        if (i0 + u < ns) z += ma[u] * ca[u];
++                }
+                 denom[rh] = z;
+             }
+         });
+diff --git a/kernels/llm/inkling2/silo/mv.cpp b/kernels/llm/inkling2/silo/mv.cpp
+index 603caae4cdf336aa70bdcbc5055e3dc873c3c773..cb539b90d563a89854eeef6ebcd80f8a3af3d0d4 100644
+--- a/kernels/llm/inkling2/silo/mv.cpp
++++ b/kernels/llm/inkling2/silo/mv.cpp
+@@ -219,6 +219,11 @@ inline float ldot(float acc, const Line<TY>& w, const XLine<TY>& x) {
+ constexpr int NSG = 4;
+ constexpr int64_t FEW_ROWS = 16384;
+ 
++// a pointer read from a job table cast to global memory (its loads then skip the run-time address-space check)
++template <class T> inline T* gptr(T* p) {
++    return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p).get();
++}
++
+ struct Job {
+     const int8_t* q;    // the matrix's quants
+     const uint8_t* s;   // its scales
+@@ -241,11 +246,18 @@ void mv_launch(sycl::queue& q, Jobs jobs, int64_t blocks) {
+         auto sg = it.get_sub_group();
+         const int lane = (int) sg.get_local_linear_id();
+         const int64_t blk = it.get_group(0) * NSG + sg.get_group_linear_id();
+-        int ji = 0;
++        // The job copied with fixed indexes and its pointers cast to global memory: pointers read from the job table
++        // are generic, and loads through generic pointers are slow (idea and measurement: steveseguin
++        // b70-optimization-lab inkling2, gemv.hpp gptr / multi.hpp pick_job). Same loads, same arithmetic.
++        Job jb = jobs.j[0];
+ #pragma unroll
+         for (int i = 1; i < 8; ++i)
+-            if (i < jobs.n && blk >= jobs.j[i].blk0) ji = i;
+-        const Job jb = jobs.j[ji];
++            if (i < jobs.n && blk >= jobs.j[i].blk0) jb = jobs.j[i];
++        jb.q = gptr(jb.q);
++        jb.s = gptr(jb.s);
++        jb.xq = gptr(jb.xq);
++        jb.xd = gptr(jb.xd);
++        jb.y = gptr(jb.y);
+         const int64_t r0 = (blk - jb.blk0) * R;
+         if (r0 >= jb.rows) return;
+         const int64_t nl = lines<TY>(jb.n_in), qr = qrow(TY, jb.n_in), sr = srow(TY, jb.n_in), nb = jb.n_in / 32;
+@@ -534,9 +546,10 @@ int ns_ink2s_rms_xq_many(ns_gpu* g, int m, const float* const* xs, const float*
+             const int64_t t = it.get_group(0) % T;
+             const int k = (int) (it.get_group(0) / T);
+             const int tid = (int) it.get_local_id(0);
+-            const float* xr = jb.x[k] + t * n;
+-            const float* w = jb.w[k];
+-            float* y = jb.y[k];
++            // pointers from the job table cast to global memory (see gptr)
++            const float* xr = gptr(jb.x[k]) + t * n;
++            const float* w = gptr(jb.w[k]);
++            float* y = jb.y[k] ? gptr(jb.y[k]) : nullptr;
+             float ss = 0.0f;
+             for (int64_t i = tid; i < n; i += W) ss += xr[i] * xr[i];
+             const float inv = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) / (float) n + eps);
+@@ -549,7 +562,7 @@ int ns_ink2s_rms_xq_many(ns_gpu* g, int m, const float* const* xs, const float*
+             auto sg = it.get_sub_group();
+             const int lane = (int) sg.get_local_linear_id(), sgi = (int) sg.get_group_linear_id();
+             float* rp = row.get_multi_ptr<sycl::access::decorated::no>().get();
+-            for (int64_t b = sgi; b < n / 32; b += W / SG) quant_block(sg, lane, rp + b * 32, jb.q[k] + t * n + b * 32, jb.d[k] + t * (n / 32) + b);
++            for (int64_t b = sgi; b < n / 32; b += W / SG) quant_block(sg, lane, rp + b * 32, gptr(jb.q[k]) + t * n + b * 32, gptr(jb.d[k]) + t * (n / 32) + b);
+         });
+     });
+     return 0;
