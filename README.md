@@ -72,7 +72,10 @@ here is generic: no personal paths, keys or hostnames; scripts take their locati
    symmetric INT8 target full-attention KV with hybrid XMX-prefix + SLM-tail FlashDecoding (`2.45x` faster 100K
    attention+merge, `0.042` nats/tok 100K KLD), reaching `152.4–155.7 tok/s` at 39K, `108.3–113.5 tok/s` sampled /
    `128.1` greedy / `64.5` plain at 100K, `1,899 tok/s` 100K prefill, `115.7 tok/s` chat, and `688,128` (`672K`) max
-   context with DSpark enabled (`733,184` without) on one 32 GB B70. [`docs/18-inkling-neon-decode.md`](docs/18-inkling-neon-decode.md)
+   context with DSpark enabled (`733,184` without) on one 32 GB B70. Graded suites (`effort=low`, `temp=1`): 39-task
+   pooled client decode rises from `105.0` (0059) and `115.1` (0061) to `140.4 tok/s` on `f16` (`33/39`, `23/24` `convo`,
+   `21/21` `long`) and `143.4 tok/s` on `q8` (`34/39`, `24/24` `convo`, `21/21` `long` hitting `150.5 tok/s` at 78K, plus
+   `103K` and `206.6K` 7 %-depth needles passed at `138.4` and `112.6` client / `101.6` engine tok/s). [`docs/18-inkling-neon-decode.md`](docs/18-inkling-neon-decode.md)
 3. **On this GPU avoid IQ-type quants for the big tensors** (IQ4_XS decodes at 13 tok/s where Q4_K_S does 30) and
    requantize with an importance matrix; and do not re-block NVFP4 into Q4_0/Q5_0 unless you accept +13 % perplexity.
 

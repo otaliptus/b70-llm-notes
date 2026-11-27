@@ -2,7 +2,7 @@
 
 Patches 0062 and 0063 stack on patch 0061 across both the `nextsycl` `inkling2` silo (`kernels/llm/inkling2/silo/`) and the Rust engine (`llm/inkling2/src/`). By default (`NS_INK2_KV=f16`), every target forward-pass output and full-vocabulary score remains **byte-identical** to 0059 and 0061 while raising single-stream decode on one Intel Arc Pro B70 (32 GB) serving AtomicChat `Inkling-2-Mini-Uncensored-AD-Q4_K.gguf` + 32,768-row DSpark from **60.2 tok/s** (0059) and **64.4 tok/s** (0061) to **96.4–96.8 tok/s** at 100K (+50 % over 0061, +60 % over 0059), **141.0 tok/s** at 39K (+31 %), **133.8 tok/s** at 7.3K (+21 %), **147.2 tok/s** steady-state short decode, **90.6 tok/s** plain short decode (+10 %), and **113.5 tok/s** on the 14-turn conversation replay (+25 %) while reproducing all 14 published visible and reasoning hashes.
 
-Patch 0063 also adds an opt-in symmetric INT8 full-attention target KV cache (`NS_INK2_KV=q8` or `--opt-kv q8`) with hybrid XMX `s8 x s8` prefix + SLM tail FlashDecoding, cutting 100K full-attention + merge GPU time 2.45x (`4,203 -> 1,719 µs/tok`), lifting 39K decode to **152.4–155.7 tok/s** (+45 % over 0061), 100K decode to **108.3–113.5 tok/s** at temperature 1 (**128.1 tok/s** greedy, **64.5 tok/s** plain), 100K prompt reading to **1,899 tok/s**, 14-turn chat decode to **115.7 tok/s**, and empirical single-B70 maximum context from **375,808 to 688,128 tokens (`672K`)** with DSpark enabled (**733,184 tokens / `716K`** without drafter). [Patch 0062](../patches/0062-nextsycl-inkling-neon-decode.patch) · [Patch 0063](../patches/0063-nextsycl-inkling-q8-kv-and-moe-sfu.patch) · [Patch 0061 notes](17-inkling-decode-attention.md) · [Release guide](15-inkling-nextsycl.md)
+Patch 0063 also adds an opt-in symmetric INT8 full-attention target KV cache (`NS_INK2_KV=q8` or `--opt-kv q8`) with hybrid XMX `s8 x s8` prefix + SLM tail FlashDecoding, cutting 100K full-attention + merge GPU time 2.45x (`4,203 -> 1,719 µs/tok`), lifting 39K decode to **152.4–155.7 tok/s** (+45 % over 0061), 100K decode to **108.3–113.5 tok/s** at temperature 1 (**128.1 tok/s** greedy, **64.5 tok/s** plain), 100K prompt reading to **1,899 tok/s**, 14-turn chat decode to **115.7 tok/s**, pooled 39-task benchmark decode from **105.0** (0059) and **115.1** (0061) to **140.4 tok/s** (`f16`, 33/39) and **143.4 tok/s** (`q8`, 34/39, **24/24** `convo` turns, **21/21** `long` items up to 78K at **102–150.5 tok/s**, and **101.6 engine / 112.6 client tok/s** on a **206,648-token** needle), and empirical single-B70 maximum context from **375,808 to 688,128 tokens (`672K`)** with DSpark enabled (**733,184 tokens / `716K`** without drafter). [Patch 0062](../patches/0062-nextsycl-inkling-neon-decode.patch) · [Patch 0063](../patches/0063-nextsycl-inkling-q8-kv-and-moe-sfu.patch) · [Patch 0061 notes](17-inkling-decode-attention.md) · [Release guide](15-inkling-nextsycl.md)
 
 ## Why 0061 plateaued at 64.4 tok/s at 100K
 
@@ -76,6 +76,19 @@ Fixed-seed CLI and served decode (`nextsycl llm generate` / `serve-inkling-nexts
 | **100K plain** (`drafts=0`, `128` tok) | 42.3 | 47.8 | 50.89 | **53.15–53.18** (**+11.2 % vs 0061**) | **64.50** (**+34.9 % vs 0061**, **+52.5 % vs 0059**) |
 | **14-turn chat replay** (served via launcher) | 81.7 | 91.2 | 112.86 | **113.50** (14/14 hashes) | **115.69** (14/14 turns) |
 | **100K prompt reading** | ~1,800 | ~1,800 | 1,813–1,824 | **1,812–1,814** | **1,891–1,899** (**+4.7 %**) |
+
+Graded accuracy and long-context suites (`bench/run_bench.py` and `bench/run_convo.py`, served via `scripts/serve-inkling-nextsycl.sh`, `reasoning_effort=low`, `temp=1.0, top_p=1.0, top_k=0`; 7 %-depth needles at `temp=0`):
+
+| suite | 0059 | 0061 | **0063 (`f16` default)** | **0063 (`KV=q8` opt-in)** |
+|---|---:|---:|---:|---:|
+| **39-task graded score** (`code` + `comprehension` + `knowledge`) | 33, 33, 35 / 39 | 34, 37, 34 / 39 | **33 / 39** (`8 min`, `61K` tok) | **34 / 39** (`6 min`, `53K` tok) |
+| **39-task pooled client decode** | 105.0 tok/s | 115.1 tok/s | **140.4 tok/s** (**+22.0 %** vs 0061, peak `193.5`) | **143.4 tok/s** (**+24.6 %** vs 0061, peak `186.5`) |
+| **Multi-turn `convo`** (`8` conversations, `24` checked turns) | — | — | **7 / 8 convos, 23 / 24 turns** (`1 min`) | **8 / 8 convos, 24 / 24 turns (100 %)** (`1 min`) |
+| **Long-context `@ 8k`** (`~11.3K` prompt tok, `7` items) | — | — | **7 / 7 PASS** (`120.7–160.4 tok/s`, `0.41s` cached TTFT) | **7 / 7 PASS** (`126.5–175.4 tok/s`, `0.40s` cached TTFT) |
+| **Long-context `@ 32k`** (`~37.2K` prompt tok, `7` items) | — | — | **7 / 7 PASS** (`116.3–145.3 tok/s`, `0.59s` cached TTFT) | **7 / 7 PASS** (`127.7–167.1 tok/s`, `0.56s` cached TTFT) |
+| **Long-context `@ 64k`** (`~77.7K` prompt tok, `7` items) | — | — | **7 / 7 PASS** (`93.7–121.0 tok/s`, `1.10s` cached TTFT) | **7 / 7 PASS** (`101.7–150.5 tok/s`, `1.03s` cached TTFT) |
+| **103K 7 %-depth needle** (`103,349` prompt tok) | — | — | **PASS** (`59.8s` TTFT, **108.0 tok/s** client) | **PASS** (`56.3s` TTFT, **138.4 tok/s** client / `121.6` engine) |
+| **206.6K 7 %-depth needle** (`206,648` prompt tok, `CTX=262144`) | — | — | — | **PASS** (`139.5s` TTFT, **112.6 tok/s** client / **101.6 tok/s** engine, `75/92` drafts) |
 
 ### Empirical maximum context on one 32 GB Arc Pro B70
 
