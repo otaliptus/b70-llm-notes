@@ -8,6 +8,7 @@ if [[ ${1:-} == --help ]]; then
     echo 'WIDE_PREFILL defaults to 1 and lets the runtime select a memory-fitting prompt batch. Set it to 0 for the original policy.'
     echo 'PREFILL_CHUNK pins the prompt batch size explicitly.'
     echo 'Set DRAFT_WINDOW=2048 with runtime patch 0060 to limit long-context proposal attention. The default is 0.'
+    echo 'KV defaults to f16 (bit-exact); set KV=q8 with patch 0063 for symmetric INT8 full-attention KV.'
     echo 'PROMPT_CACHE_MIB sets the host checkpoint cache budget in MiB and defaults to 6144.'
     exit 0
 fi
@@ -31,6 +32,7 @@ exec docker run --rm --init --name "inkling-unc-native-$port" --stop-timeout 10 
     -e ONEAPI_DEVICE_SELECTOR=level_zero:0 -e NS_IN_IMAGE=1 -e NS_LIB_FROM_DISK=1 \
     -e NEXTSYCL_LIB=/runtime/libnextsycl-llm.so -e NS_SILO_DIR=/runtime/silo -e NS_SILO_REQUIRED=1 \
     -e NS_INK2_DRAFT_WINDOW="${DRAFT_WINDOW:-0}" \
+    -e NS_INK2_KV="${KV:-f16}" \
     -e NS_INK2_WIDE_PREFILL="${WIDE_PREFILL:-1}" -e NS_INK2_CHUNK="${PREFILL_CHUNK:-}" \
     -e NS_API_KEY_FILE=/run/inference.key -e NS_FULL_VOCAB=1 \
     -e NS_INK2_DRAFT=/models/dspark.gguf -e NS_INK2_DRAFTS=6 -e NS_INK2_DRAFT_PMIN=0.65 \
