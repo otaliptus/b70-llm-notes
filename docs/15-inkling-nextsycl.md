@@ -2,6 +2,10 @@
 
 For the exact model and runtime files, the command for the 39-task grader, and the experiments that stayed out of the release, see the [November 23 experiment record](16-inkling-b70-experiment-log.md).
 
+## Single-launch ESIMD FlashDecoding, coupled INT8 DSpark, and SYCL graphs with patch 0062
+
+Patch 0062 stacks on 0061 across the `inkling2` silo and Rust engine while keeping every target score and fixed-seed output **byte-identical** to 0059/0061 (18/18 teacher-forced full-vocabulary score specs, 215/215 attention-bench cases, and 14/14 conversation hashes). It replaces two-pass long full-attention with per-`T` L1/SLM-aware single-launch ESIMD FlashDecoding, couples DSpark's temperature-1 proposals to the target's inverse-CDF draw over INT8 `fold` + INT8 Layer-1 KV + dynamic session-OOV rows, captures the decode/drafter/sampling passes in SYCL command graphs, and fuses Q8_0 loop controllers, router scans, and MoE combine+conv. Fixed-seed drafted decode rose to **96.3–96.8 tok/s** at 100K (+50 % over 0061, +60 % over 0059), **140.8 tok/s** at 39K (+31 %), **133.1 tok/s** at 7.3K (+20 %), **146.2 tok/s** steady-state short, and **112.9 tok/s** on the 14-turn chat replay; empirical max context on the 32 GB B70 is **375,808 tokens** with DSpark (**418,816** without). Apply 0062 after 0061 and rebuild the executable and silo. [Patch](../patches/0062-nextsycl-inkling-neon-decode.patch) · [Record and measurements](18-inkling-neon-decode.md)
+
 ## Faster decode attention with patch 0061
 
 Patch 0061 changes only the inkling2 silo. Check steps of 1 to 8 rows now share one tile of keys and values instead of each row reading its own copy; small kernels issue their reads first; and pointers read from job tables are cast to global memory. Every output is byte-identical to 0059 (full-vocabulary scores at 900 to 100,000 tokens and 1 to 8 rows a pass, the windowed ring's wrap, the 14-turn chat hashes). Decode is **6 to 13 % faster** at fixed seed, and the 39-task suite went from **105.0 to 115.1 tok/s** client-side pooled decode over three interleaved runs of each build. Prompt reading is unchanged. Apply 0061 after 0059 and rebuild the silo. [Patch](../patches/0061-nextsycl-inkling-decode-attention.patch) · [Record and measurements](17-inkling-decode-attention.md) · [Kernel bench](../scripts/inkling-attn-bench.sh)
@@ -174,6 +178,8 @@ AOT=bmg-g31 "$runtime_src/build.sh" all
 ```
 
 For the faster decode attention, also apply `0061-nextsycl-inkling-decode-attention.patch` after 0059 before building. It changes only the inkling2 silo, and the patched tree is `853e9daff944d88c979a6f0b1f67c55d0a78504d`. [Build notes for 0061](17-inkling-decode-attention.md#build-and-identify-it)
+
+For the full ESIMD FlashDecoding, coupled INT8 DSpark, and SYCL-graph decode stack, apply `0062-nextsycl-inkling-neon-decode.patch` after 0061 and rebuild both the host executable/library and the silo (`AOT=bmg-g31 "$runtime_src/build.sh" all`). The patched tree is `26a3e0b21ebecfd2777238eacf4c324e443be291`. [Build notes for 0062](18-inkling-neon-decode.md#build-and-identify-it)
 
 The launcher expects the built executable beside the LLM shared library and its Inkling silo subdirectory. Set `RUNTIME`, `MODELS` and `API_KEY_FILE` to local paths and `SYCL_IMAGE` to the compatible oneAPI Docker runtime image. Prepare the 32,768-row draft head with the procedure in section 5 of the llama.cpp notes. [Patch](../patches/0054-nextsycl-atomic-inkling-b70.patch) · [Launcher](../scripts/serve-inkling-nextsycl.sh) · [Draft-head preparation](14-inkling-uncensored-dspark.md) · [Upstream source](https://github.com/maxfridbe/nextsycl/tree/e3f1fd891b7fda6f478a326d913d28893a4e9811)
 
